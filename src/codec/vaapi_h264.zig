@@ -62,7 +62,8 @@ pub const FrameInfo = struct {
     idr: bool,
     /// Bytes appended to `out`.
     size: usize,
-    /// The driver's average QP, else SliceQPY from the emitted slice header.
+    /// The driver's picture-average QP, else SliceQPY from the emitted header.
+    /// With bitrate control, macroblock QP deltas can make the average differ from SliceQPY.
     avg_qp: u8,
     frame_num: u32,
     upload_ns: u64,
@@ -178,7 +179,7 @@ pub const Encoder = struct {
                 e.need_idr = true; // the client never saw the probe frame
             } else {
                 // MS-RDPEGFX 3.3.8.3.1 requires full range; radeonsi's EFC emits studio range.
-                log.warn("{s}: fused RGB->NV12 conversion is not full range, using vpp", .{e.vendor});
+                log.warn("{s}: fused RGB->NV12 conversion unavailable or not full range, using vpp", .{e.vendor});
                 e.releaseVa();
                 e.hdr.deinit(gpa);
                 var vpp = opts;
@@ -478,7 +479,7 @@ pub const Encoder = struct {
         const slice_type: bs.SliceType = if (idr or ref_index == null) .i else .p;
         if (idr) self.idr_pic_id +%= 1;
 
-        var bufs = BufList{ .dpy = self.dpy, .ctx = self.enc_ctx };
+        var bufs = BufList{ .dpy = self.dpy, .ctx = self.enc_ctx, .optional_processing = fused != null };
         defer bufs.destroy();
 
         // Read by the driver in vaRenderPicture, below.
@@ -1040,11 +1041,15 @@ const BufList = struct {
     ctx: c.VAContextID,
     ids: [24]c.VABufferID = undefined,
     n: usize = 0,
+    optional_processing: bool = false,
 
     fn add(l: *BufList, kind: c_int, data: []const u8) Error!void {
         if (l.n == l.ids.len) return error.Vaapi;
         var id: c.VABufferID = c.VA_INVALID_ID;
-        try vaCheck(c.vaCreateBuffer(l.dpy, l.ctx, @intCast(kind), @intCast(data.len), 1, @constCast(data.ptr), &id), "vaCreateBuffer");
+        const status = c.vaCreateBuffer(l.dpy, l.ctx, @intCast(kind), @intCast(data.len), 1, @constCast(data.ptr), &id);
+        // Fused conversion is probed before use; an unsupported buffer is a capability result.
+        if (l.optional_processing and kind == c.VAProcPipelineParameterBufferType and status == c.VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE) return error.Unsupported;
+        try vaCheck(status, "vaCreateBuffer");
         l.ids[l.n] = id;
         l.n += 1;
     }
@@ -1209,12 +1214,53 @@ fn fillTestFrame(buf: []u8, w: u32, h: u32, frame: u32) void {
     };
 }
 
+test "GPU: VBR and CBR report bounded average QP across bitrate changes" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const w: u32 = 978;
+    const h: u32 = 644;
+    const pixels = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(pixels);
+    var tested: usize = 0;
+    for ([_]RateControl{ .vbr, .cbr }) |mode| {
+        var enc = Encoder.init(gpa, .{ .width = w, .height = h, .bitrate = 4_000_000, .rate_control = mode, .min_qp = 20, .max_qp = 40, .conversion = .vpp, .verify = true }) catch |err| switch (err) {
+            error.Unsupported, error.VaInit, error.OpenDevice => continue,
+            else => return err,
+        };
+        defer enc.deinit();
+        tested += 1;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        var params: bs.ParamSets = .{};
+        for (0..8) |i| {
+            fillTestFrame(pixels, w, h, @intCast(i));
+            if (i == 3) {
+                enc.setBitrate(2_000_000);
+                try testing.expect(enc.rc_dirty);
+            }
+            out.clearRetainingCapacity();
+            const frame = try enc.encode(pixels, w * 4, false, &out);
+            const au = try bs.inspect(out.items, params);
+            params = au.params;
+            try testing.expect(frame.avg_qp >= enc.opts.min_qp and frame.avg_qp <= enc.opts.max_qp);
+            try testing.expect(au.first_slice.?.qp.? <= 51);
+            try testing.expectEqual(i == 0, frame.idr);
+            try testing.expectEqual(i == 0, au.idr);
+            try testing.expectEqual(@as(u32, 1), au.pictures);
+            try testing.expectEqual(@as(u32, @intCast(i)), au.first_slice.?.frame_num);
+            try testing.expect(!enc.rc_dirty);
+            try testing.expect(frame.size > 0 and frame.size == out.items.len);
+        }
+    }
+    if (tested == 0) return error.SkipZigTest;
+}
+
 test "GPU: odd-macroblock size, IDR on demand, cropping, one picture per AU" {
     if (!haveGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const w: u32 = 978;
     const h: u32 = 644;
-    var enc = Encoder.init(gpa, .{ .width = w, .height = h, .bitrate = 4_000_000, .conversion = .fused, .verify = true }) catch |err| switch (err) {
+    var enc = Encoder.init(gpa, .{ .width = w, .height = h, .rate_control = .cqp, .conversion = .fused, .verify = true }) catch |err| switch (err) {
         error.Unsupported, error.VaInit, error.OpenDevice => return error.SkipZigTest,
         else => return err,
     };
@@ -1228,11 +1274,12 @@ test "GPU: odd-macroblock size, IDR on demand, cropping, one picture per AU" {
     var prev_idr_id: ?u32 = null;
     for (0..8) |i| {
         fillTestFrame(pixels, w, h, @intCast(i));
-        if (i == 3) enc.setBitrate(2_000_000);
+        if (i == 3) enc.setQp(30);
         out.clearRetainingCapacity();
         const fi = try enc.encode(pixels, w * 4, i == 5, &out);
         const au = try bs.inspect(out.items, params);
         params = au.params;
+        try testing.expectEqual(enc.opts.qp, au.first_slice.?.qp.?);
         try testing.expectEqual(au.first_slice.?.qp.?, fi.avg_qp);
         try testing.expectEqual(@as(u32, 1), au.pictures);
         try testing.expectEqual(@as(u32, 0), au.other_count);
