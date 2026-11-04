@@ -466,7 +466,11 @@ pub fn sendDesktopFrame(c: *Conn, f: *const wl.Frame) conn_mod.Error!void {
     const h = if (swap) f.width else f.height;
     if (w != c.enc.width or h != c.enc.height) try resizeSurface(c, w, h);
     if (c.reactivating) return; // no output until the client has finalized
-    if (lay.b == 0 and f.transform == .normal and !f.y_invert) return sendFrame(c, f.data, f.stride);
+    if (lay.b == 0 and f.transform == .normal and !f.y_invert) {
+        c.ch.surf.dma_frame = f.dma;
+        defer c.ch.surf.dma_frame = null;
+        return sendFrame(c, f.data, f.stride);
+    }
     try sendFrame(c, try upright(c, f, lay), @as(usize, w) * 4);
 }
 
@@ -581,6 +585,7 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     const sid = c.ch.surface_id orelse return;
     const t0 = nowNs();
     if (try c.enc.diff(pixels, stride) == 0 and !c.enc.hasOwed()) return;
+    if (c.ch.surf.dma_frame) |buffer| try buffer.endRead();
     c.enc.touch(conn_mod.nowMs());
     // Changed tiles count toward video regions (video.zig); owed tiles do not.
     try gfx_codecs.trackVideo(c);

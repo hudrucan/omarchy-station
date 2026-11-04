@@ -18,7 +18,7 @@ jobs:
         run: >-
           pacman -Syu --noconfirm --needed
           git mise python hyprland jq
-          pkgconf openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+          pkgconf openssl pam libva libdrm mesa libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 
       - uses: actions/checkout@v4
 

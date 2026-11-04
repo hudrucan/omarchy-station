@@ -43,6 +43,9 @@ pub const thin_kbps: u64 = 2000;
 
 /// Codec state of one RDPGFX surface; decoders keep theirs per surface.
 pub const Surface = struct {
+    dma_frame: ?*@import("../wl/dmabuf.zig").Buffer = null,
+    dma_encode_off: bool = false,
+    dma_encode_seen: bool = false,
     /// AVC420, or AVC444 when opts.avc444 is set.
     h264: ?vaapi_h264.Encoder = null,
     h264_out: std.ArrayList(u8) = .empty,
@@ -363,6 +366,29 @@ pub fn subtract(a: gfx.Rect16, b: gfx.Rect16, out: *[4]gfx.Rect16) []const gfx.R
 
 /// The H.264 picture: the shadow's pixels of `rects` copied in, out to the 16-pixel macroblock
 /// grid; the rest keeps what was coded before. Whole after a reset or a new size.
+pub fn coversFrame(rects: []const gfx.Rect16, width: u32, height: u32) bool {
+    var bottom: u32 = 0;
+    for (rects) |r| {
+        if (r.left != 0 or r.right != width or r.top != bottom or r.bottom <= r.top or r.bottom > height) return false;
+        bottom = r.bottom;
+    }
+    return bottom == height and height > 0;
+}
+
+test "DMA-BUF encode needs the whole picture, without gaps or overlaps" {
+    const t = std.testing;
+    try t.expect(coversFrame(&.{.{ .left = 0, .top = 0, .right = 128, .bottom = 65 }}, 128, 65));
+    const rows = [_]gfx.Rect16{
+        .{ .left = 0, .top = 0, .right = 128, .bottom = 64 },
+        .{ .left = 0, .top = 64, .right = 128, .bottom = 65 },
+    };
+    try t.expect(coversFrame(&rows, 128, 65));
+    try t.expect(!coversFrame(rows[0..1], 128, 65));
+    try t.expect(!coversFrame(&.{ rows[0], rows[0] }, 128, 65));
+    try t.expect(!coversFrame(&.{.{ .left = 1, .top = 0, .right = 128, .bottom = 65 }}, 128, 65));
+    try t.expect(!coversFrame(&.{}, 128, 65));
+}
+
 fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
     const s = &c.ch.surf;
     const e = &c.enc;
@@ -600,7 +626,16 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     s.h264_out.clearRetainingCapacity();
     const src = try h264Source(c, content);
     const mbs = if (idr) dirty_mbs else dirty_mbs + refinedMbs(c, qp);
-    const info = try h.encode(src, c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    const dma = if (!s.dma_encode_off and coversFrame(content, width, height)) s.dma_frame else null;
+    const info = if (dma) |buffer| h.encodeDmaBuf(buffer.descriptor(), s.need_idr, &s.h264_out) catch |err| blk: {
+        log.info("DMA-BUF encode unavailable ({t}); using CPU upload", .{err});
+        s.dma_encode_off = true;
+        break :blk try h.encode(src, c.enc.shadowStride(), true, &s.h264_out);
+    } else try h.encode(src, c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    if (dma != null and !s.dma_encode_off and !s.dma_encode_seen) {
+        s.dma_encode_seen = true;
+        log.info("H.264 directly imports the capture DMA-BUF for whole-picture updates", .{});
+    }
     s.need_idr = false;
     noteRefs(c, qp, info.idr);
     avcSent(c, mbs, qp, info.idr, info.size);

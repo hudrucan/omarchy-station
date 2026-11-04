@@ -3,6 +3,7 @@
 //! the next takeFrame()/deinit; `Frame.damage` is relative to the previously taken frame.
 
 const std = @import("std");
+const dmabuf = @import("dmabuf.zig");
 const wire = @import("wire.zig");
 const sys = @import("sys.zig");
 const shm = @import("shm.zig");
@@ -81,6 +82,7 @@ fn unionRect(a: Rect, b: Rect) Rect {
 }
 
 pub const Frame = struct {
+    dma: ?*dmabuf.Buffer = null,
     /// Rows `stride` bytes apart; XRGB8888/ARGB8888 are B,G,R,X/A bytes in memory.
     data: []const u8,
     width: u32,
@@ -103,6 +105,7 @@ pub const Frame = struct {
 pub const Backend = enum { auto, ext, wlr };
 
 pub const Options = struct {
+    dmabuf: bool = true,
     backend: Backend = .auto,
     /// Composite the cursor into frames (RDP normally draws it client-side).
     paint_cursors: bool = false,
@@ -124,6 +127,8 @@ const Constraints = struct {
     height: u32 = 0,
     formats: [16]u32 = undefined,
     nformats: usize = 0,
+    dma_device: ?u64 = null,
+    dma_linear: [2]bool = .{ false, false },
 
     fn addFormat(c: *Constraints, f: u32) void {
         if (c.nformats < c.formats.len) {
@@ -150,6 +155,7 @@ const Hook = struct {
 };
 
 pub const Capture = struct {
+    dma_disabled: bool = false,
     client: *Client,
     output: ?*Output,
     kind: enum { ext, wlr },
@@ -212,6 +218,7 @@ pub const Capture = struct {
         const cap = try client.gpa.create(Capture);
         errdefer client.gpa.destroy(cap);
         cap.* = .{
+            .dma_disabled = !opts.dmabuf,
             .client = client,
             .output = output,
             .kind = kind,
@@ -255,6 +262,7 @@ pub const Capture = struct {
     /// Completes once the content changed (at once for the first frame). No-op while one is in
     /// flight or a completed frame is not taken yet.
     pub fn requestFrame(cap: *Capture) Error!void {
+        if (cap.front_set) |set| if (set.gpu) |gpu| try gpu.buffers[cap.front.?].endRead();
         switch (cap.state) {
             .stopped => return error.Stopped,
             .failed => return error.CaptureFailed,
@@ -284,6 +292,7 @@ pub const Capture = struct {
         if (!same_shape) cap.out_damage.setFull();
         cap.out_rect[0] = .{ .x = 0, .y = 0, .width = @intCast(set.width), .height = @intCast(set.height) };
         cap.out = .{
+            .dma = if (set.gpu) |gpu| &gpu.buffers[idx] else null,
             .data = set.buffers[idx].data,
             .width = set.width,
             .height = set.height,
@@ -334,12 +343,69 @@ pub const Capture = struct {
     }
 
     fn ensureBuffers(cap: *Capture, w: u32, h: u32, stride: u32, format: P.WlShm.Format) Error!void {
-        if (cap.cur) |s| if (s.matches(w, h, stride, format)) return;
+        if (cap.cur) |s| if (s.gpu == null and s.matches(w, h, stride, format)) return;
         const gpa = cap.client.gpa;
         const conn = cap.client.conn;
         const ns = try gpa.create(shm.BufferSet);
         errdefer gpa.destroy(ns);
         ns.* = try shm.BufferSet.create(conn, cap.client.shm.?, 2, w, h, stride, format);
+        cap.replaceBuffers(ns);
+        log.debug("capture buffers {d}x{d} stride {d} format {t}", .{ w, h, stride, format });
+    }
+
+    fn ensureExtBuffers(cap: *Capture, constraints: Constraints, format: P.WlShm.Format) Error!bool {
+        const w = constraints.width;
+        const h = constraints.height;
+        const index: ?usize = switch (format) {
+            .xrgb8888 => 0,
+            .argb8888 => 1,
+            else => null,
+        };
+        if (!cap.dma_disabled and index != null and constraints.dma_linear[index.?] and constraints.dma_device != null and cap.client.dmabuf != null) {
+            const device = constraints.dma_device.?;
+            const matches = if (cap.cur) |s| s.matches(w, h, w * 4, format) and s.gpu != null and s.gpu.?.device_id == device else false;
+            if (!matches) {
+                const gpa = cap.client.gpa;
+                const ns = try gpa.create(shm.BufferSet);
+                const gpu = dmabuf.Pool.create(gpa, cap.client.conn, cap.client.dmabuf.?, device, w, h, if (index.? == 0) dmabuf.xrgb8888 else dmabuf.argb8888, .{ .ctx = cap, .func = dmaReady }) catch |err| {
+                    gpa.destroy(ns);
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    log.info("DMA-BUF capture unavailable ({t}); using shared memory", .{err});
+                    cap.dma_disabled = true;
+                    try cap.ensureBuffers(w, h, w * 4, format);
+                    return true;
+                };
+                ns.* = .{ .gpu = gpu, .count = 2, .width = w, .height = h, .stride = gpu.buffers[0].stride, .format = format };
+                cap.replaceBuffers(ns);
+                log.info("DMA-BUF capture: {d}x{d}, linear RGB on the compositor device", .{ w, h });
+            }
+            const set = cap.cur.?;
+            const gpu = set.gpu.?;
+            if (gpu.pending > 0) return false;
+            if (!gpu.failed) {
+                if (gpu.buffers[0].stride != gpu.buffers[1].stride) gpu.failed = true;
+            }
+            if (!gpu.failed) {
+                for (0..2) |i| set.buffers[i] = .{ .proxy = gpu.buffers[i].proxy.?, .data = gpu.buffers[i].data };
+                return true;
+            }
+            cap.dma_disabled = true;
+            log.info("compositor refused DMA-BUF capture; using shared memory", .{});
+        }
+        try cap.ensureBuffers(w, h, w * 4, format);
+        return true;
+    }
+
+    fn dmaReady(ctx: *anyopaque) void {
+        const cap: *Capture = @ptrCast(@alignCast(ctx));
+        cap.kick() catch {
+            cap.state = .failed;
+        };
+    }
+
+    fn replaceBuffers(cap: *Capture, ns: *shm.BufferSet) void {
+        const gpa = cap.client.gpa;
+        const conn = cap.client.conn;
         if (cap.cur) |old| {
             if (cap.ready_set == old) {
                 // Stale size; a fresh frame (with full damage) follows.
@@ -361,7 +427,6 @@ pub const Capture = struct {
         cap.cur = ns;
         cap.buf_valid = .{ false, false };
         cap.buf_damage = .{ .{}, .{} };
-        log.debug("capture buffers {d}x{d} stride {d} format {t}", .{ w, h, stride, format });
     }
 
     fn beginFrame(cap: *Capture) void {
@@ -377,6 +442,16 @@ pub const Capture = struct {
     fn finishFrame(cap: *Capture) void {
         const set = cap.cur.?;
         const idx = cap.target.?;
+        if (set.gpu) |gpu| gpu.buffers[idx].beginRead() catch {
+            cap.dma_disabled = true;
+            cap.target = null;
+            cap.state = .idle;
+            cap.want_frame = true;
+            cap.kick() catch {
+                cap.state = .failed;
+            };
+            return;
+        };
         // Other buffers miss this frame's changes; hint them next time.
         for (0..set.count) |j| if (j != idx) cap.buf_damage[j].merge(&cap.frame_damage, set.width, set.height);
         cap.buf_damage[idx].clear();
@@ -421,7 +496,7 @@ pub const Capture = struct {
             cap.state = .failed;
             return;
         };
-        try cap.ensureBuffers(c.width, c.height, c.width * 4, format);
+        if (!try cap.ensureExtBuffers(c, format)) return;
         const conn = cap.client.conn;
         const set = cap.cur.?;
         const idx = cap.pickTarget();
@@ -447,10 +522,19 @@ pub const Capture = struct {
                 cap.pending.height = b.height;
             },
             .shm_format => |f| cap.pending.addFormat(@backingInt(f.format)),
-            .dmabuf_device, .dmabuf_format => {},
+            .dmabuf_device => |d| {
+                if (d.device.len == @sizeOf(u64)) cap.pending.dma_device = @bitCast(d.device[0..8].*);
+            },
+            .dmabuf_format => |f| {
+                const idx: usize = if (f.format == dmabuf.xrgb8888) 0 else if (f.format == dmabuf.argb8888) 1 else return;
+                var i: usize = 0;
+                while (i + 8 <= f.modifiers.len) : (i += 8) {
+                    if (@as(u64, @bitCast(f.modifiers[i..][0..8].*)) == 0) cap.pending.dma_linear[idx] = true;
+                }
+            },
             .done => {
                 cap.constraints = cap.pending;
-                cap.pending.nformats = 0;
+                cap.pending = .{};
                 if (cap.state == .negotiating) cap.state = .idle;
                 try cap.kick();
             },
@@ -480,6 +564,10 @@ pub const Capture = struct {
                 if (cap.ext_frame) |fr| try fr.destroy(conn);
                 cap.ext_frame = null;
                 log.debug("ext capture failed: {t}", .{f.reason});
+                if (cap.cur) |set| if (set.gpu != null and f.reason != .stopped) {
+                    cap.dma_disabled = true;
+                    log.info("DMA-BUF frame refused; using shared memory", .{});
+                };
                 try cap.frameFailed(@backingInt(f.reason), f.reason == .stopped);
             },
         }

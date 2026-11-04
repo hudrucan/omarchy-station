@@ -74,6 +74,7 @@ pub const DesktopConfig = struct {
     binds_state_path: ?[:0]const u8 = null,
     console_state_path: ?[:0]const u8 = null,
     capture_backend: wl_capture.Backend = .ext,
+    capture_dmabuf: bool = true,
     cursor: desktop_mod.CursorMode = .auto,
 };
 
@@ -879,6 +880,7 @@ pub const Conn = struct {
             .binds_state_path = cfg.binds_state_path,
             .console_state_path = cfg.console_state_path,
             .capture_backend = cfg.capture_backend,
+            .capture_dmabuf = cfg.capture_dmabuf,
             .cursor = cfg.cursor,
             .layout = layout,
             .recovery_marker = cfg.recovery_marker,

@@ -58,6 +58,7 @@ pub const Options = struct {
     require_fence: bool = false,
     cursor: cursor_mod.Mode = .auto,
     capture_backend: wl.capture.Backend = .ext,
+    capture_dmabuf: bool = true,
     /// Option + drag bindings added, for omastation-recover after a crash; null: none.
     binds_state_path: ?[:0]const u8 = null,
     /// Console restore plan while remote, for omastation-recover after a crash; null: none.
@@ -438,7 +439,7 @@ pub const Desktop = struct {
         const slot = d.captureSlot(i);
         if (slot.*) |cap| cap.deinit();
         slot.* = null;
-        slot.* = try wl.Capture.init(client, out, .{ .backend = d.opts.capture_backend, .paint_cursors = d.cursor.painting });
+        slot.* = try wl.Capture.init(client, out, .{ .backend = d.opts.capture_backend, .dmabuf = d.opts.capture_dmabuf, .paint_cursors = d.cursor.painting });
         if (slot.*.?.kind == .wlr) log.info("{s}: capturing with wlr-screencopy", .{d.plan.outputs[i].name()});
         try slot.*.?.requestFrame();
     }

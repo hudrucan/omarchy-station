@@ -27,6 +27,10 @@
 #include <sys/un.h>
 #include <va/va.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
+#include <gbm.h>
+#include <xf86drm.h>
+#include <linux/dma-buf.h>
 #include <va/va_enc_h264.h>
 #include <linux/input.h>
 #include <linux/uinput.h>

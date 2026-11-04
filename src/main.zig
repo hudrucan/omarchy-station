@@ -84,6 +84,7 @@ const usage =
     \\                         none: don't load it)
     \\  --capture-backend B    how the desktop is captured: ext (ext-image-copy-capture,
     \\                         default) or wlr (wlr-screencopy; testing)
+    \\  --no-dmabuf           capture through shared memory instead of DMA-BUF
     \\  --cursor MODE          who draws the pointer: auto (the client, once the
     \\                         compositor's cursor capture works; default), client
     \\                         (always), paint (painted into the frames)
@@ -180,6 +181,7 @@ const Options = struct {
     alt_drag: omastation.session.altdrag.Mode = .auto,
     hyprland_plugin: ?[:0]const u8 = omastation.session.plugin.default_path,
     capture_backend: omastation.wl.capture.Backend = .ext,
+    capture_dmabuf: bool = true,
     cursor: omastation.session.desktop.CursorMode = .auto,
     animate: bool = false,
     detail: bool = false,
@@ -338,6 +340,7 @@ pub fn main(init: std.process.Init) !void {
             .binds_state_path = binds_state,
             .console_state_path = console_state,
             .capture_backend = o.capture_backend,
+            .capture_dmabuf = o.capture_dmabuf,
             .cursor = o.cursor,
         };
         if (o.allow_tls) log.warn("--desktop ignores --insecure-allow-tls: desktop sessions require NLA", .{});
@@ -499,6 +502,8 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
         } else if (std.mem.eql(u8, a, "--hyprland-plugin")) {
             o.hyprland_plugin = if (std.mem.eql(u8, val, "none")) null else val;
             i += 1;
+        } else if (std.mem.eql(u8, a, "--no-dmabuf")) {
+            o.capture_dmabuf = false;
         } else if (std.mem.eql(u8, a, "--capture-backend")) {
             o.capture_backend = std.meta.stringToEnum(omastation.wl.capture.Backend, val) orelse return fail("bad --capture-backend");
             if (o.capture_backend == .auto) return fail("bad --capture-backend");
@@ -808,6 +813,16 @@ fn configDir(arena: std.mem.Allocator, env: *std.process.Environ.Map) ![:0]const
 fn fail(msg: []const u8) error{InvalidArguments} {
     std.debug.print("omastation: {s}\n{s}", .{ msg, usage });
     return error.InvalidArguments;
+}
+
+test "--no-dmabuf leaves following options intact" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var o = Options{};
+    try std.testing.expect(o.capture_dmabuf);
+    try std.testing.expectEqual(Parsed.run, try parseOptions(arena_state.allocator(), &.{ "omastation", "--no-dmabuf", "--frame-interval", "16" }, 1, &o));
+    try std.testing.expect(!o.capture_dmabuf);
+    try std.testing.expectEqual(@as(u32, 16), o.features.frame_interval_ms);
 }
 
 test "--udp-version takes its value: 3 selects RDP-UDP2 and the options after it are still read" {

@@ -12,7 +12,7 @@ On Omarchy, `./install-omarchy` installs dependencies and the built package. To
 prepare a development machine without installing Omastation:
 
 ```sh
-omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libdrm mesa libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 mise trust
 mise install
 ```
@@ -30,6 +30,7 @@ not in a package build tree. There is no compiler download during `make build`.
 | `make plugin` | Build the native plugin against installed Hyprland |
 | `make check` | Build server/plugin, check formatting and shell syntax, run Zig and Python tests |
 | `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
+| `make test-capture` | Compare DMA-BUF and SHM on a static `BASE` output in a test compositor |
 | `make package` | Snapshot the working tree and build an Arch package |
 | `make install` | Build the package and install it through makepkg/pacman |
 | `make hyprland-package` | Build the separate patched compositor package |
@@ -43,6 +44,16 @@ The checks use fake desktop-start commands and a fake compositor where applicabl
 They do not enable units, change login settings or establish a real remote desktop
 session. A successful check is not a live client compatibility or display-isolation
 test.
+
+`make test-capture` is an optional GPU integration test for a static output
+named `BASE` in a separate test compositor. It compares DMA-BUF pixels against
+shared-memory capture, exercises VA-API import, and reports static-frame timings.
+It requires working DMA-BUF capture and a VA-API H.264 driver; it is separate from
+`make check`. Run it with the test compositor's `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR`; it uses the same external build directory as `make build`.
+For resize lifetime checks, set `OMASTATION_CAPTURE_TEST_ALLOW_RESIZE=1` with a
+private runtime directory under `/tmp`. This also changes the test output `BASE`
+to 960x641; it is not intended for a live desktop.
 
 For fewer parallel jobs or another build location:
 

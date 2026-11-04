@@ -93,6 +93,7 @@ pub const Client = struct {
     output_list: std.ArrayList(*Output) = .empty,
 
     shm: ?P.WlShm = null,
+    dmabuf: ?P.ZwpLinuxDmabufV1 = null,
     shm_formats: [32]u32 = undefined,
     shm_format_count: usize = 0,
 
@@ -232,6 +233,9 @@ pub const Client = struct {
                 try client.globals.append(client.gpa, .{ .name = g.name, .interface = iface, .version = g.version });
                 const reg = client.registry;
                 switch (iface) {
+                    .zwp_linux_dmabuf_v1 => if (client.dmabuf == null and g.version >= 3) {
+                        client.dmabuf = try reg.bind(conn, g.name, P.ZwpLinuxDmabufV1, 3);
+                    },
                     .wl_shm => if (client.shm == null) {
                         client.shm = try reg.bind(conn, g.name, P.WlShm, bindVersion(g.version, 2));
                         conn.setHandler(client.shm.?.id, wire.Handler.init(Client, client, onShm));

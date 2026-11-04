@@ -7,6 +7,7 @@ const c = @import("c");
 const bs = @import("h264_bitstream.zig");
 const va = @import("h264_va.zig");
 const avc444 = @import("avc444.zig");
+const dmabuf = @import("../core/dmabuf.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.h264);
@@ -316,6 +317,35 @@ pub const Encoder = struct {
         info.encode_ns = nowNs() - t0;
         info.total_ns = info.encode_ns;
         return info;
+    }
+
+    /// Import capture storage directly; encoding completes before releasing the surface.
+    pub fn encodeDmaBuf(self: *Encoder, buffer: dmabuf.Frame, force_idr: bool, out: *std.ArrayList(u8)) Error!FrameInfo {
+        if (self.opts.avc444 != null or buffer.fd < 0 or
+            buffer.width < (self.opts.width + 15) & ~@as(u32, 15) or
+            buffer.height < (self.opts.height + 15) & ~@as(u32, 15) or
+            @as(u64, buffer.stride) < @as(u64, buffer.width) * 4 or
+            @as(u64, buffer.size) < @as(u64, buffer.stride) * buffer.height) return error.BadInput;
+        var desc = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
+        desc.fourcc = if (buffer.format == dmabuf.xrgb8888) c.VA_FOURCC_BGRX else if (buffer.format == dmabuf.argb8888) c.VA_FOURCC_BGRA else return error.BadInput;
+        desc.width = buffer.width;
+        desc.height = buffer.height;
+        desc.num_objects = 1;
+        desc.objects[0].fd = buffer.fd;
+        desc.objects[0].size = buffer.size;
+        desc.objects[0].drm_format_modifier = 0;
+        desc.num_layers = 1;
+        desc.layers[0].drm_format = buffer.format;
+        desc.layers[0].num_planes = 1;
+        desc.layers[0].pitch[0] = buffer.stride;
+        var attrs = [_]c.VASurfaceAttrib{
+            .{ .type = c.VASurfaceAttribMemoryType, .flags = c.VA_SURFACE_ATTRIB_SETTABLE, .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 } } },
+            .{ .type = c.VASurfaceAttribExternalBufferDescriptor, .flags = c.VA_SURFACE_ATTRIB_SETTABLE, .value = .{ .type = c.VAGenericValueTypePointer, .value = .{ .p = &desc } } },
+        };
+        var surface: c.VASurfaceID = c.VA_INVALID_ID;
+        try vaCheck(c.vaCreateSurfaces(self.dpy, c.VA_RT_FORMAT_RGB32, buffer.width, buffer.height, &surface, 1, &attrs, attrs.len), "vaCreateSurfaces(DMA-BUF)");
+        defer _ = c.vaDestroySurfaces(self.dpy, &surface, 1);
+        return self.encodeSurface(surface, force_idr, out);
     }
 
     /// Codes the views `lc` asks for (MS-RDPEGFX 2.2.4.5), each into its own list. An IDR

@@ -1,9 +1,9 @@
 const std = @import("std");
 
-pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
+pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "gbm", "drm", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
 
 // For translate-c: headers outside /usr/include.
-const system_include_dirs = [_][]const u8{ "/usr/include/pipewire-0.3", "/usr/include/spa-0.2" };
+const system_include_dirs = [_][]const u8{ "/usr/include/pipewire-0.3", "/usr/include/spa-0.2", "/usr/include/libdrm" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -66,6 +66,19 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     run_bench.addPassthruArgs();
     b.step("bench", "Time the CPU codecs (RemoteFX, progressive) on synthetic frames").dependOn(&run_bench.step);
+
+    const capture_test = b.addExecutable(.{
+        .name = "omastation-capture-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/capture.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "omastation", .module = lib_mod }},
+        }),
+    });
+    const run_capture_test = b.addRunArtifact(capture_test);
+    b.step("test-capture", "Compare DMA-BUF and SHM capture on a static test output").dependOn(&run_capture_test.step);
 
     const test_filters = b.option([]const []const u8, "test-filter", "unit tests: only those whose name contains this") orelse &.{};
     const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });

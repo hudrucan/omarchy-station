@@ -3,6 +3,7 @@
 const std = @import("std");
 const wire = @import("wire.zig");
 const sys = @import("sys.zig");
+const dmabuf = @import("dmabuf.zig");
 const P = wire.proto;
 
 pub const Error = wire.Error;
@@ -13,8 +14,9 @@ pub const Buffer = struct {
 };
 
 pub const BufferSet = struct {
-    mem: sys.SharedMemory,
-    pool: P.WlShmPool,
+    mem: ?sys.SharedMemory = null,
+    pool: ?P.WlShmPool = null,
+    gpu: ?*dmabuf.Pool = null,
     buffers: [max_buffers]Buffer = undefined,
     count: usize,
     width: u32,
@@ -63,12 +65,16 @@ pub const BufferSet = struct {
     }
 
     pub fn matches(set: *const BufferSet, width: u32, height: u32, stride: u32, format: P.WlShm.Format) bool {
-        return set.width == width and set.height == height and set.stride == stride and set.format == format;
+        return set.width == width and set.height == height and (set.gpu != null or set.stride == stride) and set.format == format;
     }
 
     pub fn destroy(set: *BufferSet, conn: *wire.Connection) void {
-        for (set.buffers[0..set.count]) |b| b.proxy.destroy(conn) catch {};
-        set.mem.destroy();
+        if (set.gpu) |gpu| {
+            gpu.destroy();
+        } else {
+            for (set.buffers[0..set.count]) |b| b.proxy.destroy(conn) catch {};
+            if (set.mem) |*mem| mem.destroy();
+        }
         set.* = undefined;
     }
 };

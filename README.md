@@ -85,6 +85,12 @@ uses the separate image clipboard formats.
 `omastation --desktop`; the optional login service runs `omastation --login`.
 Client monitor size, scale and layout are negotiated on connection.
 
+Desktop capture uses linear DMA-BUF buffers when supported by the compositor and
+GPU, with shared-memory fallback. Full-picture AVC420 updates can import these
+buffers directly into VA-API; mixed regions and refinement keep the CPU reference
+image so text and UI updates retain their existing codec policy. Use `--no-dmabuf`
+to force shared-memory capture when troubleshooting.
+
 The native plugin is compiled against the installed Hyprland headers and build
 ID. Its package hook rebuilds it after Hyprland upgrades. Log in again after an
 upgrade so the running compositor matches the installed files.

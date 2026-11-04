@@ -10,7 +10,7 @@ if ! command -v omarchy >/dev/null; then
 fi
 
 omarchy pkg add \
-  base-devel mise python hyprland uwsm jq openssl pam libva \
+  base-devel mise python hyprland uwsm jq openssl pam libva libdrm mesa \
   libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 
 mise trust "$repo_dir/mise.toml"
