@@ -1,6 +1,6 @@
 pkgname=omastation
 pkgver=0.0.1
-pkgrel=3
+pkgrel=4
 pkgdesc="RDP server for your Hyprland desktop"
 url="https://github.com/hudrucan/omastation"
 arch=(x86_64)

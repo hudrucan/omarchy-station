@@ -1501,7 +1501,13 @@ fn freeFormats(gpa: Allocator, formats: []Format) void {
 const FormatKind = enum { unicode_text, ansi_text, oem_text, dib, dibv5, png, html, file_list, concealed, other };
 
 fn kindOf(f: Format) FormatKind {
-    if (f.id < registered_format_first) return switch (f.id) {
+    // MS-RDPECLIP 1.3.1.2: named format IDs are assigned by the peer OS.
+    // Windows' RegisterClipboardFormat range does not constrain other peers.
+    if (std.mem.eql(u8, f.name, name_html_format)) return .html;
+    if (std.mem.eql(u8, f.name, name_png)) return .png;
+    if (std.mem.eql(u8, f.name, name_file_group_descriptor_w)) return .file_list;
+    if (std.mem.eql(u8, f.name, name_exclude_from_monitor)) return .concealed;
+    return switch (f.id) {
         CF_UNICODETEXT => .unicode_text,
         CF_TEXT => .ansi_text,
         CF_OEMTEXT => .oem_text,
@@ -1509,11 +1515,34 @@ fn kindOf(f: Format) FormatKind {
         CF_DIBV5 => .dibv5,
         else => .other,
     };
-    if (std.mem.eql(u8, f.name, name_html_format)) return .html;
-    if (std.mem.eql(u8, f.name, name_png)) return .png;
-    if (std.mem.eql(u8, f.name, name_file_group_descriptor_w)) return .file_list;
-    if (std.mem.eql(u8, f.name, name_exclude_from_monitor)) return .concealed;
-    return .other;
+}
+
+test "clipboard: named formats use peer IDs outside the Windows registered range" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    try testing.expectEqual(FormatKind.file_list, kindOf(.{ .id = 0x1234, .name = name_file_group_descriptor_w }));
+    try testing.expectEqual(FormatKind.png, kindOf(.{ .id = 0x2345, .name = name_png }));
+    try testing.expectEqual(FormatKind.html, kindOf(.{ .id = 0x3456, .name = name_html_format }));
+    try testing.expectEqual(FormatKind.concealed, kindOf(.{ .id = 0x4567, .name = name_exclude_from_monitor }));
+    try testing.expectEqual(FormatKind.unicode_text, kindOf(.{ .id = CF_UNICODETEXT }));
+    try testing.expectEqual(FormatKind.dib, kindOf(.{ .id = CF_DIB }));
+    try testing.expectEqual(FormatKind.other, kindOf(.{ .id = 0x5678, .name = "unknown" }));
+
+    const formats = [_]Format{
+        .{ .id = 0x1234, .name = name_file_group_descriptor_w },
+        .{ .id = 0x2345, .name = name_png },
+    };
+    const offers = try offersForRemoteFormats(gpa, &formats, all_general_flags);
+    defer gpa.free(offers);
+    try testing.expectEqual(@as(usize, 3), offers.len);
+    try testing.expectEqualStrings(mime_png, offers[0].mime);
+    try testing.expectEqual(formats[1].id, offers[0].format_id);
+    try testing.expectEqualStrings(mime_uri_list, offers[1].mime);
+    try testing.expectEqual(formats[0].id, offers[1].format_id);
+    const without_streaming = try offersForRemoteFormats(gpa, &formats, CB_USE_LONG_FORMAT_NAMES);
+    defer gpa.free(without_streaming);
+    try testing.expectEqual(@as(usize, 1), without_streaming.len);
+    try testing.expectEqualStrings(mime_png, without_streaming[0].mime);
 }
 
 /// Mime types compare case-insensitively (RFC 2045 5.1).
