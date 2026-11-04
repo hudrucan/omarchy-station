@@ -44,6 +44,10 @@ They do not enable units, change login settings or establish a real remote deskt
 session. A successful check is not a live client compatibility or display-isolation
 test.
 
+The graphics log counts input events serviced during bounded VA-API waits.
+Graphics/control PDUs remain ordered with input. GPU capture and masked NV12
+conversion use the upstream Vulkan pipeline; `--no-gpu-capture` selects SHM.
+
 For fewer parallel jobs or another build location:
 
 ```sh

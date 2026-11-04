@@ -23,6 +23,9 @@ pub const ColorConversion = enum {
     fused,
 };
 
+/// Called on the encoder's thread between bounded GPU waits; must not reenter the encoder.
+pub const WaitHook = struct { ctx: *anyopaque, func: *const fn (*anyopaque) void };
+
 pub const Options = struct {
     width: u32,
     height: u32,
@@ -53,6 +56,7 @@ pub const Options = struct {
     /// AVC444 view packing (`encode444`), coded at avc444.viewSize without cropping;
     /// null is AVC420 (`encode`).
     avc444: ?avc444.Version = null,
+    wait_hook: ?WaitHook = null,
 };
 
 /// The pictures `encode444` coded (null: that view was not coded).
@@ -579,10 +583,7 @@ pub const Encoder = struct {
         try vaCheck(rs, "vaRenderPicture(encode)");
         try vaCheck(es, "vaEndPicture(encode)");
 
-        const st = c.vaSyncBuffer(self.dpy, self.coded_buf, sync_timeout_ns);
-        if (st == c.VA_STATUS_ERROR_UNIMPLEMENTED) {
-            try vaCheck(c.vaSyncSurface(self.dpy, target), "vaSyncSurface");
-        } else try vaCheck(st, "vaSyncBuffer");
+        try self.syncPicture(target);
 
         const driver_qp = try self.readCoded(out);
         const size = out.items.len - start;
@@ -615,6 +616,28 @@ pub const Encoder = struct {
             .encode_ns = nowNs() - t0,
             .total_ns = nowNs() - t0,
         };
+    }
+
+    fn syncPicture(self: *Encoder, target: c.VASurfaceID) Error!void {
+        const hook = self.opts.wait_hook;
+        const deadline = nowNs() + sync_timeout_ns;
+        var buffer_sync = true;
+        while (true) {
+            if (hook) |h| h.func(h.ctx);
+            const left = deadline -| nowNs();
+            const timeout = if (hook != null) @min(left, std.time.ns_per_ms) else left;
+            var st = if (buffer_sync) c.vaSyncBuffer(self.dpy, self.coded_buf, timeout) else c.vaSyncSurface2(self.dpy, target, timeout);
+            if (st == c.VA_STATUS_ERROR_UNIMPLEMENTED) {
+                if (buffer_sync) {
+                    buffer_sync = false;
+                    continue;
+                }
+                st = c.vaSyncSurface(self.dpy, target);
+            }
+            if (st == c.VA_STATUS_ERROR_TIMEDOUT and nowNs() < deadline) continue;
+            try vaCheck(st, if (buffer_sync) "vaSyncBuffer" else "vaSyncSurface");
+            return;
+        }
     }
 
     /// Pictures between reference `r` and the current one; frame_num wraps at `max_frame_num`.

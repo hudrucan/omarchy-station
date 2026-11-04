@@ -38,6 +38,7 @@ const hypr = @import("../session/hypr.zig");
 const altdrag = @import("../session/altdrag.zig");
 const wl_capture = @import("../wl/capture.zig");
 const session_info = @import("session_info.zig");
+const input_pump_mod = @import("input_pump.zig");
 const remoteapp = @import("remoteapp.zig");
 pub const flight = @import("flight.zig");
 const c = @import("c");
@@ -191,6 +192,10 @@ pub const Conn = struct {
     anim_last_ms: i64 = 0,
     /// Recent traffic, dumped when the connection ends abnormally or on SIGUSR1.
     flight: flight.Recorder = .{},
+    input_pump: input_pump_mod.Pump = .{},
+    encode_input_enabled: bool = false,
+    dispatching_input: bool = false,
+    encode_input_error: ?Error = null,
 
     pub fn init(gpa: std.mem.Allocator, t: transport_mod.Transport, tls_ctx: *tls.Context, auth_cfg: *const AuthConfig, desktop_cfg: ?*const DesktopConfig, peer: []const u8) Conn {
         return .{ .gpa = gpa, .t = t, .tls_ctx = tls_ctx, .auth_cfg = auth_cfg, .desktop_cfg = desktop_cfg, .seat = if (desktop_cfg) |d| d.seat else null, .peer = peer, .enc = encoder_mod.Encoder.init(gpa) };
@@ -237,6 +242,7 @@ pub const Conn = struct {
         deadline.stop(&self.deadline); // before the socket is closed
         self.t.deinit();
         self.flight.deinit(self.gpa);
+        self.input_pump.deinit(self.gpa);
     }
 
     fn mayLinger(self: *const Conn) bool {
@@ -965,14 +971,17 @@ pub const Conn = struct {
         var events: [fastpath.max_events]fastpath.InputEvent = undefined;
         // From here on nothing waits on the network.
         try self.t.startNonBlocking();
+        self.encode_input_enabled = true;
+        defer self.encode_input_enabled = false;
         flow.start(self);
         self.pacing.logged_ms = nowMs();
         var pass_start = nowNs();
         while (true) {
+            if (self.encode_input_error) |err| return err;
             // Input first, including PDUs buffered inside TLS that poll() misses; a flood yields.
             var more_input = false;
             var budget: u32 = max_input_pdus;
-            while (try self.t.tryNext()) |pdu| {
+            while (try self.input_pump.next(&self.t)) |pdu| {
                 if (!try self.handlePdu(pdu, &events)) return;
                 budget -= 1;
                 if (budget == 0) {
@@ -1021,7 +1030,7 @@ pub const Conn = struct {
             if (self.flight.on()) timeout = if (timeout < 0) flight.live_poll_ms else @min(timeout, flight.live_poll_ms);
             if (self.pacing.retry_ms) |r| timeout = if (timeout < 0) @intCast(r) else @min(timeout, @as(c_int, @intCast(r)));
             timeout = flow.pollTimeout(self, timeout);
-            if (more_input) timeout = 0;
+            if (more_input or self.input_pump.pending() or self.encode_input_error != null) timeout = 0;
             if (d) |dd| if (dd.desk_activity) {
                 timeout = 0;
             };
@@ -1084,6 +1093,9 @@ pub const Conn = struct {
 
     /// Handles one client PDU; false when the client disconnected.
     fn handlePdu(self: *Conn, pdu: transport_mod.Pdu, events: []fastpath.InputEvent) Error!bool {
+        const was_dispatching = self.dispatching_input;
+        self.dispatching_input = true;
+        defer self.dispatching_input = was_dispatching;
         return self.dispatchPdu(pdu, events) catch |err| {
             self.flight.failed(if (pdu.kind == .fastpath) .fastpath else .mcs, pdu.data.len, err);
             return err;
@@ -1140,6 +1152,22 @@ pub const Conn = struct {
             .mouse_rel => |m| try d.onPointerRel(m.flags, m.dx, m.dy),
             .qoe_timestamp => {},
         }
+    }
+
+    /// TLS and Wayland stay on their owning thread; graphics/control PDUs wait for the frame.
+    pub fn pumpEncodeInput(ctx: *anyopaque) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (!self.encode_input_enabled or self.dispatching_input or self.encode_input_error != null) return;
+        self.input_pump.duringEncode(self.gpa, &self.t, self, handleEncodeInput) catch |err| {
+            self.encode_input_error = err;
+        };
+    }
+
+    fn handleEncodeInput(self: *Conn, pdu: transport_mod.Pdu) Error!void {
+        var events: [fastpath.max_events]fastpath.InputEvent = undefined;
+        const before = self.input_events;
+        _ = try self.handlePdu(pdu, &events);
+        self.ch.stats.encode_input_events += self.input_events - before;
     }
 
     /// Test pattern: 3 s of motion, 2 s still; with `test_video`, a 30 fps video 15 s of every 20.

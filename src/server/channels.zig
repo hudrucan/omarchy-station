@@ -63,6 +63,7 @@ pub const Stats = struct {
     planar_rects: u64 = 0,
     video_frames: u64 = 0,
     h264_bytes: u64 = 0,
+    encode_input_events: u64 = 0,
 };
 
 const stats_interval_ms = 5000;

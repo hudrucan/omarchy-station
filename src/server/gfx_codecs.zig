@@ -621,7 +621,7 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     };
     const r = nominal(c);
     if (s.h264 == null) {
-        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device }, c.vc.opts.graphics.h264_encoder);
+        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device, .wait_hook = .{ .ctx = c, .func = Conn.pumpEncodeInput } }, c.vc.opts.graphics.h264_encoder);
         s.need_idr = true;
         // The refinement wait is picked once, from the link's rate, as Windows' encoder does.
         const rate = c.flow.rate() * 8;
@@ -699,7 +699,7 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     const r = nominal(c);
     if (s.h264 == null) {
         // Init probes AVC444 on the device: error.Unsupported drops to AVC420.
-        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device }, c.vc.opts.graphics.h264_encoder);
+        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device, .wait_hook = .{ .ctx = c, .func = Conn.pumpEncodeInput } }, c.vc.opts.graphics.h264_encoder);
         s.need_idr = true;
         log.info("{s}: H.264 AVC444v2 encoder ready on {s} ({d}x{d}, QP per frame from its byte budget, {d} fps at most)", .{ c.peer, s.h264.?.node, width, height, r.fps });
     }
