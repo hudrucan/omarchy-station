@@ -1,0 +1,10 @@
+// An unprivileged user may start only their own fixed desktop unit, including over SSH.
+// Unit files and this rule must remain root-owned. No arbitrary systemd-run privileges.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        /^[a-zA-Z_][a-zA-Z0-9_-]*$/.test(subject.user) && subject.user != "root" &&
+        action.lookup("unit") == "omastation-session@" + subject.user + ".service" &&
+        action.lookup("verb") == "start") {
+        return polkit.Result.YES;
+    }
+});

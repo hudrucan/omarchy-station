@@ -1,0 +1,17 @@
+[Unit]
+Description=On-demand Omarchy desktop for %i
+After=systemd-user-sessions.service
+
+[Service]
+User=%i
+PAMName=login
+WorkingDirectory=~
+Environment=XDG_SESSION_TYPE=wayland XDG_SESSION_CLASS=user XDG_SESSION_DESKTOP=Hyprland XDG_CURRENT_DESKTOP=Hyprland
+Environment=XDG_SEAT=seat0 XDG_VTNR=8 AQ_NO_KMS_REQUIREMENT=1
+TTYPath=/dev/tty8
+StandardInput=tty
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+ExecStart=/usr/lib/omastation/omastation-session-launch
+# No Restart: logout must end the desktop until the next authenticated RDP login.

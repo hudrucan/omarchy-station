@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+# PAM has registered this process on VT 8; DRM requires that session to be active.
+: "${XDG_SESSION_ID:?Missing PAM login session}"
+loginctl activate "$XDG_SESSION_ID"
+exec /usr/bin/uwsm start -g -1 -e -D Hyprland hyprland.desktop

@@ -59,6 +59,9 @@ pub const Error = error{
 
 /// Desktop takeover settings; null serves a test pattern instead.
 pub const DesktopConfig = struct {
+    login: ?*@import("../session/login.zig").Login = null,
+    login_plugin: ?[:0]const u8 = null,
+    recovery_marker: ?[:0]const u8 = null,
     ipc: hypr.Ipc,
     seat: *seat_mod.Seat,
     lock_command: []const u8 = "omarchy-system-lock",
@@ -593,6 +596,10 @@ pub const Conn = struct {
         var ok = false;
         const entry = cfg.store.find(creds.user);
         if (entry) |e| {
+            // A boot listener serves only its Unix owner, even with extra NLA verifiers.
+            if (self.desktop_cfg) |d| if (d.login) |l| {
+                l.authorize(e.name()) catch return error.AuthenticationFailed;
+            };
             self.user = e.name();
             var ubuf: [128]u8 = undefined;
             var pbuf: [1024]u8 = undefined;
@@ -857,10 +864,11 @@ pub const Conn = struct {
             log.err("{s}: desktop sessions require NLA", .{self.peer});
             return error.AuthenticationFailed;
         }
+        if (cfg.login != null and self.auth_cfg.pam_service == null) return error.AuthenticationFailed;
         const size = self.client.desktopSize();
         // An output per client monitor (MS-RDPBCGR 2.2.1.3.6); unservable layouts are refused first.
         const layout = surfaces.clientLayout(self) catch |err| return self.rejectMonitors(err);
-        const opts: desktop_mod.Options = .{
+        var opts: desktop_mod.Options = .{
             .width = size.width,
             .height = size.height,
             .scale_percent = self.client.scalePercent(),
@@ -873,6 +881,7 @@ pub const Conn = struct {
             .capture_backend = cfg.capture_backend,
             .cursor = cfg.cursor,
             .layout = layout,
+            .recovery_marker = cfg.recovery_marker,
         };
         self.claim = seat_mod.Claim.init() catch return error.DesktopFailed;
         const got = cfg.seat.acquireWith(&self.claim.?, 20_000, .{ .cookie = self.arc_cookie, .user = self.user }) catch |err| {
@@ -887,7 +896,26 @@ pub const Conn = struct {
                 return error.DesktopFailed;
             };
         } else {
-            const d = try desktop_mod.Desktop.create(self.gpa, cfg.ipc, opts);
+            var ipc = cfg.ipc;
+            var endpoint: ?@import("../session/login.zig").Endpoint = null;
+            if (cfg.login) |l| {
+                endpoint = l.prepare(self.gpa, self.user.?) catch |err| {
+                    log.err("{s}: cannot start the desktop ({t}); check omastation-session and its systemd journal", .{ self.peer, err });
+                    return error.DesktopFailed;
+                };
+                ipc = endpoint.?.ipc;
+                opts.display = endpoint.?.display();
+                if (cfg.login_plugin) |path| {
+                    const staging = @import("../session/plugin.zig").Staging.inRuntimeDir(self.gpa, l.runtime_dir) catch return error.OutOfMemory;
+                    defer self.gpa.free(staging.dir);
+                    defer self.gpa.free(staging.state);
+                    var report: [400]u8 = undefined;
+                    _ = @import("../session/plugin.zig").activate(&ipc, self.gpa, path, staging, &report);
+                }
+                if (cfg.binds_state_path) |path| altdrag.removeStale(&ipc, self.gpa, path);
+                @import("../session/textbinds.zig").resetStale(&ipc, self.gpa);
+            }
+            const d = try desktop_mod.Desktop.create(self.gpa, ipc, opts);
             self.desktop = d;
             d.enter() catch |err| {
                 log.err("{s}: could not take the desktop remote: {t}", .{ self.peer, err });
