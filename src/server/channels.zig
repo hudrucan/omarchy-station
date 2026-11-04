@@ -57,9 +57,52 @@ pub const Stats = struct {
     planar_rects: u64 = 0,
     video_frames: u64 = 0,
     h264_bytes: u64 = 0,
+    dma_frames: u64 = 0,
+    dma_partial_frames: u64 = 0,
+    frame_latency: FrameLatency = .{},
 };
 
 const stats_interval_ms = 5000;
+
+/// Presentation to local socket flush, excluding network transit and client decode.
+/// At most the latest 512 frames of a stats interval; no allocation on the frame path.
+const FrameLatency = struct {
+    samples: [512]u64 = @splat(0),
+    count: usize = 0,
+    next: usize = 0,
+
+    fn note(s: *FrameLatency, presented_ns: u64, flushed_ns: u64) void {
+        if (presented_ns == 0 or presented_ns > flushed_ns) return;
+        s.samples[s.next] = flushed_ns - presented_ns;
+        s.next = (s.next + 1) % s.samples.len;
+        s.count = @min(s.count + 1, s.samples.len);
+    }
+
+    fn percentiles(s: *const FrameLatency) ?struct { p50: u64, p95: u64 } {
+        if (s.count == 0) return null;
+        var samples = s.samples;
+        const values = samples[0..s.count];
+        std.mem.sort(u64, values, {}, std.sort.asc(u64));
+        return .{ .p50 = values[(s.count * 50 + 99) / 100 - 1], .p95 = values[(s.count * 95 + 99) / 100 - 1] };
+    }
+};
+
+test "frame latency ignores unknown or future presentation times and bounds its sample window" {
+    const t = std.testing;
+    var s: FrameLatency = .{};
+    s.note(0, 10);
+    s.note(11, 10);
+    try t.expect(s.percentiles() == null);
+    s.note(1, 3);
+    s.note(1, 11);
+    s.note(1, 6);
+    try t.expectEqual(@as(u64, 5), s.percentiles().?.p50);
+    try t.expectEqual(@as(u64, 10), s.percentiles().?.p95);
+    for (0..513) |_| s.note(1, 8);
+    try t.expectEqual(@as(usize, 512), s.count);
+    try t.expectEqual(@as(u64, 7), s.percentiles().?.p50);
+    try t.expectEqual(@as(u64, 7), s.percentiles().?.p95);
+}
 
 /// Share of the screen outside the video region that must change in a frame to switch to motion.
 pub const avc_min_change = 0.10;
@@ -86,6 +129,7 @@ pub const State = struct {
     frames_unacked: u32 = 0,
     stats: Stats = .{},
     sent_ns: [32]u64 = @splat(0),
+    presented_ns: u64 = 0,
     policy: codec_policy.Gfx = .{},
     codec_off: std.EnumSet(codec_policy.Motion) = .empty,
     surf: gfx_codecs.Surface = .{},
@@ -466,6 +510,8 @@ pub fn sendDesktopFrame(c: *Conn, f: *const wl.Frame) conn_mod.Error!void {
     const h = if (swap) f.width else f.height;
     if (w != c.enc.width or h != c.enc.height) try resizeSurface(c, w, h);
     if (c.reactivating) return; // no output until the client has finalized
+    c.ch.presented_ns = f.presented_ns;
+    defer c.ch.presented_ns = 0;
     if (lay.b == 0 and f.transform == .normal and !f.y_invert) {
         c.ch.surf.dma_frame = f.dma;
         defer c.ch.surf.dma_frame = null;
@@ -585,6 +631,7 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     const sid = c.ch.surface_id orelse return;
     const t0 = nowNs();
     if (try c.enc.diff(pixels, stride) == 0 and !c.enc.hasOwed()) return;
+    try gfx_codecs.trackH264Changes(c);
     if (c.ch.surf.dma_frame) |buffer| try buffer.endRead();
     c.enc.touch(conn_mod.nowMs());
     // Changed tiles count toward video regions (video.zig); owed tiles do not.
@@ -639,6 +686,7 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     st.encode_ns += t2 - t1;
     st.zgfx_ns += t3 - t2;
     st.send_ns += t4 - t3;
+    st.frame_latency.note(c.ch.presented_ns, t4);
     logStats(c);
 }
 
@@ -788,7 +836,12 @@ fn logStats(c: *Conn) void {
         std.fmt.bufPrint(&region_buf, "{d}x{d} at {d},{d}", .{ r.right - r.left, r.bottom - r.top, r.left, r.top }) catch "?"
     else
         "none";
-    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444, {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks", .{
+    var latency_buf: [128]u8 = undefined;
+    const latency: []const u8 = if (st.frame_latency.percentiles()) |p|
+        std.fmt.bufPrint(&latency_buf, "p50 {d:.2} ms, p95 {d:.2} ms ({d} samples)", .{ ms(p.p50, 1), ms(p.p95, 1), st.frame_latency.count }) catch "?"
+    else
+        "n/a";
+    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444, {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks; DMA-BUF {d} frames ({d} partial); present->flush {s}", .{
         c.peer,
         f * 1000.0 / @as(f64, @floatFromInt(el)),
         st.avc_frames,
@@ -811,6 +864,9 @@ fn logStats(c: *Conn) void {
         ms(st.send_ns, f),
         ms(st.ack_ns, @max(1.0, @as(f64, @floatFromInt(st.acks)))),
         st.blocked,
+        st.dma_frames,
+        st.dma_partial_frames,
+        latency,
     });
     st.* = .{ .since_ms = now };
 }

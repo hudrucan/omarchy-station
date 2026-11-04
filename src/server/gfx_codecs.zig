@@ -81,6 +81,9 @@ pub const Surface = struct {
     /// The shadow, copied in only where a frame is coded with H.264 (whole when `h264_src_ok` is false).
     h264_src: []u8 = &.{},
     h264_src_ok: bool = false,
+    /// Macroblocks where the shadow differs from the RGB source last given to H.264.
+    h264_changed: std.DynamicBitSetUnmanaged = .{},
+    h264_source_width: u32 = 0,
     /// Scratch for a frame's rects: lossless pieces, H.264 region rects.
     pieces: std.ArrayList(Piece) = .empty,
     avc_rects: std.ArrayList(gfx.Rect16) = .empty,
@@ -104,6 +107,7 @@ pub const Surface = struct {
         s.scratch_rects.deinit(gpa);
         s.video.deinit(gpa);
         gpa.free(s.h264_src);
+        s.h264_changed.deinit(gpa);
         s.pieces.deinit(gpa);
         s.avc_rects.deinit(gpa);
         s.piece_rects.deinit(gpa);
@@ -123,6 +127,7 @@ pub const Surface = struct {
         s.need_idr = true;
         @memset(s.ref_qp, no_ref);
         s.h264_src_ok = false;
+        s.h264_changed.setAll();
         s.video.forget();
         s.region_h264 = false;
         if (s.chroma) |*d| d.rects.clearRetainingCapacity();
@@ -145,6 +150,24 @@ pub const Surface = struct {
         s.clearDmaReference();
         s.dma_reference = .{ .buffer = buffer, .width = width, .height = height };
         s.h264_src_ok = false;
+        s.h264_changed.unsetAll();
+    }
+
+    fn ensureSourceChanges(s: *Surface, gpa: std.mem.Allocator, width: u32, height: u32) !void {
+        const count = @as(usize, (width + 15) / 16) * ((height + 15) / 16);
+        if (s.h264_source_width == width and s.h264_changed.bit_length == count) return;
+        try s.h264_changed.resize(gpa, count, true);
+        s.h264_changed.setAll();
+        s.h264_source_width = width;
+    }
+
+    fn sourceBlocks(s: *Surface, rect: gfx.Rect16, changed: bool) void {
+        const cols = (s.h264_source_width + 15) / 16;
+        var y: usize = rect.top / 16;
+        while (y < (@as(u32, rect.bottom) + 15) / 16) : (y += 1) {
+            var x: usize = rect.left / 16;
+            while (x < (@as(u32, rect.right) + 15) / 16) : (x += 1) s.h264_changed.setValue(y * cols + x, changed);
+        }
     }
 
     fn ensureH264Source(s: *Surface, gpa: std.mem.Allocator, len: usize) !void {
@@ -415,7 +438,7 @@ pub fn coversFrame(rects: []const gfx.Rect16, width: u32, height: u32) bool {
     return bottom == height and height > 0;
 }
 
-test "DMA-BUF encode needs the whole picture, without gaps or overlaps" {
+test "whole-picture coverage excludes gaps and overlaps" {
     const t = std.testing;
     try t.expect(coversFrame(&.{.{ .left = 0, .top = 0, .right = 128, .bottom = 65 }}, 128, 65));
     const rows = [_]gfx.Rect16{
@@ -429,14 +452,42 @@ test "DMA-BUF encode needs the whole picture, without gaps or overlaps" {
     try t.expect(!coversFrame(&.{}, 128, 65));
 }
 
+/// Called after diff, before owed tiles or codec selection change its rectangles.
+pub fn trackH264Changes(c: *Conn) !void {
+    const s = &c.ch.surf;
+    try s.ensureSourceChanges(c.gpa, c.enc.width, c.enc.height);
+    for (c.enc.rects.items, 0..) |_, i| s.sourceBlocks(c.enc.tightRect(i), true);
+}
+
+/// A partial update can import the capture if every changed source block is included.
+/// Otherwise keep the old pixels outside the selected blocks, as h264Source does.
+fn dmaSourceMatches(c: *const Conn, rects: []const gfx.Rect16) bool {
+    if (rects.len == 0) return false; // Refinement reuses its previous source.
+    const s = &c.ch.surf;
+    if (!s.h264_src_ok and s.dma_reference == null) return true;
+    const cols = (c.enc.width + 15) / 16;
+    var it = s.h264_changed.iterator(.{});
+    while (it.next()) |i| {
+        const x = i % cols;
+        const y = i / cols;
+        for (rects) |r| {
+            if (x >= r.left / 16 and x < (@as(u32, r.right) + 15) / 16 and
+                y >= r.top / 16 and y < (@as(u32, r.bottom) + 15) / 16) break;
+        } else return false;
+    }
+    return true;
+}
+
 fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
     const s = &c.ch.surf;
     const e = &c.enc;
+    try s.ensureSourceChanges(c.gpa, e.width, e.height);
     try s.materializeDmaReference(c.gpa);
     try s.ensureH264Source(c.gpa, e.shadow.len);
     if (!s.h264_src_ok) {
         @memcpy(s.h264_src, e.shadow);
         s.h264_src_ok = true;
+        s.h264_changed.unsetAll();
         return s.h264_src;
     }
     const stride = e.shadowStride();
@@ -449,6 +500,7 @@ fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
             const o = y * stride + x0 * 4;
             @memcpy(s.h264_src[o..][0 .. (x1 - x0) * 4], e.shadow[o..][0 .. (x1 - x0) * 4]);
         }
+        s.sourceBlocks(r, false);
     }
     return s.h264_src;
 }
@@ -475,6 +527,49 @@ test "CPU H.264 source preserves pixels outside selected macroblocks for refinem
     const refine = try h264Source(&c, &.{});
     try std.testing.expectEqual(@as(u8, 9), refine[0]);
     try std.testing.expectEqual(@as(u8, 1), refine[64]);
+}
+
+test "partial DMA-BUF updates require every accumulated source change, including odd edges" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var c: Conn = undefined;
+    c.gpa = gpa;
+    c.enc = encoder_mod.Encoder.init(gpa);
+    defer c.enc.deinit();
+    c.ch.surf = .{};
+    defer c.ch.surf.deinit(gpa);
+    try c.enc.reset(192, 33);
+    const stride = c.enc.shadowStride();
+    const pixels = try gpa.alloc(u8, c.enc.shadow.len);
+    defer gpa.free(pixels);
+    @memset(pixels, 1);
+    _ = try c.enc.diff(pixels, stride);
+    try trackH264Changes(&c);
+    _ = try h264Source(&c, &.{});
+    const inside: gfx.Rect16 = .{ .left = 5, .top = 5, .right = 6, .bottom = 6 };
+    const edge: gfx.Rect16 = .{ .left = 191, .top = 32, .right = 192, .bottom = 33 };
+    pixels[5 * stride + 5 * 4] = 9;
+    pixels[32 * stride + 191 * 4] = 7;
+    _ = try c.enc.diff(pixels, stride);
+    try trackH264Changes(&c);
+    try t.expect(!dmaSourceMatches(&c, &.{inside}));
+    try t.expect(dmaSourceMatches(&c, &.{ inside, edge }));
+    const source = try h264Source(&c, &.{inside});
+    try t.expectEqual(@as(u8, 9), source[5 * stride + 5 * 4]);
+    try t.expectEqual(@as(u8, 1), source[32 * stride + 191 * 4]);
+    // An unchanged capture cannot erase an older change sent outside H.264.
+    try t.expectEqual(@as(usize, 0), try c.enc.diff(pixels, stride));
+    try trackH264Changes(&c);
+    try t.expect(!dmaSourceMatches(&c, &.{inside}));
+    try t.expect(!dmaSourceMatches(&c, &.{}));
+    _ = try h264Source(&c, &.{edge});
+    try t.expect(dmaSourceMatches(&c, &.{inside}));
+    try t.expectEqualSlices(u8, pixels, c.ch.surf.h264_src);
+    c.ch.surf.reset();
+    // A new source starts with the entire shadow, even for a partial first update.
+    try t.expect(dmaSourceMatches(&c, &.{inside}));
+    try c.ch.surf.ensureSourceChanges(gpa, 32, 65);
+    try t.expectEqual(@as(usize, 10), c.ch.surf.h264_changed.count());
 }
 
 fn writeMotion(c: *Conn, w: *bytes.Writer, sid: u16, m: policy.Motion) !Sent {
@@ -686,17 +781,22 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     h.setQp(qp);
     s.h264_out.clearRetainingCapacity();
     const mbs = if (idr) dirty_mbs else dirty_mbs + refinedMbs(c, qp);
-    const dma = if (!s.dma_encode_off and coversFrame(content, width, height)) s.dma_frame else null;
+    try s.ensureSourceChanges(c.gpa, width, height);
+    const dma = if (!s.dma_encode_off and dmaSourceMatches(c, content)) s.dma_frame else null;
     const info = if (dma) |buffer| h.encodeDmaBuf(buffer.descriptor(), s.need_idr, &s.h264_out) catch |err| blk: {
         log.info("DMA-BUF encode unavailable ({t}); using CPU upload", .{err});
         s.dma_encode_off = true;
         const src = try h264Source(c, content);
         break :blk try h.encode(src, c.enc.shadowStride(), true, &s.h264_out);
     } else try h.encode(try h264Source(c, content), c.enc.shadowStride(), s.need_idr, &s.h264_out);
-    if (dma) |buffer| if (!s.dma_encode_off) s.rememberDmaReference(buffer, width, height);
+    if (dma) |buffer| if (!s.dma_encode_off) {
+        s.rememberDmaReference(buffer, width, height);
+        c.ch.stats.dma_frames += 1;
+        if (!coversFrame(content, width, height)) c.ch.stats.dma_partial_frames += 1;
+    };
     if (dma != null and !s.dma_encode_off and !s.dma_encode_seen) {
         s.dma_encode_seen = true;
-        log.info("H.264 directly imports the capture DMA-BUF for whole-picture updates", .{});
+        log.info("H.264 directly imports the capture DMA-BUF when its source matches the selected updates", .{});
     }
     s.need_idr = false;
     noteRefs(c, qp, info.idr);

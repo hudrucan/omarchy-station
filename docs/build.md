@@ -57,6 +57,13 @@ For resize lifetime checks, set `OMASTATION_CAPTURE_TEST_ALLOW_RESIZE=1` with a
 private runtime directory under `/tmp`. This also changes the test output `BASE`
 to 960x641; it is not intended for a live desktop.
 
+The graphics log reports DMA-BUF frame counts, including partial updates, and
+`present->flush` p50/p95 latency. These measure compositor presentation to the
+server's local socket flush, excluding network transit and client decoding.
+Each five-second interval retains at most its latest 512 latency samples; frames
+without a valid presentation timestamp are omitted. This helps compare latency
+when both builds already reach the display's frame rate.
+
 For fewer parallel jobs or another build location:
 
 ```sh
