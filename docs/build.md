@@ -48,6 +48,8 @@ test.
 `make test-capture` is an optional GPU integration test for a static output
 named `BASE` in a separate test compositor. It compares DMA-BUF pixels against
 shared-memory capture, exercises VA-API import, and reports static-frame timings.
+It also checks import-cache reuse and invalidation, deferred CPU reference images,
+and retained-buffer lifetime after capture and Wayland-client teardown.
 It requires working DMA-BUF capture and a VA-API H.264 driver; it is separate from
 `make check`. Run it with the test compositor's `WAYLAND_DISPLAY` and
 `XDG_RUNTIME_DIR`; it uses the same external build directory as `make build`.

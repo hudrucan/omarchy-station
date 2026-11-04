@@ -6,12 +6,14 @@ const wire = @import("wire.zig");
 const sys = @import("sys.zig");
 const P = wire.proto;
 const dma = @import("../core/dmabuf.zig");
+var next_buffer_id: std.atomic.Value(u64) = .init(1);
 
 pub const xrgb8888 = dma.xrgb8888;
 pub const argb8888 = dma.argb8888;
 pub const Hook = struct { ctx: *anyopaque, func: *const fn (*anyopaque) void };
 
 pub const Buffer = struct {
+    id: u64 = 0,
     bo: *c.struct_gbm_bo,
     fd: c_int,
     width: u32,
@@ -26,7 +28,15 @@ pub const Buffer = struct {
     reading: bool = false,
 
     pub fn descriptor(b: *const Buffer) dma.Frame {
-        return .{ .fd = b.fd, .width = b.width, .height = b.height, .stride = b.stride, .format = b.format, .size = @intCast(b.data.len) };
+        return .{ .id = b.id, .fd = b.fd, .width = b.width, .height = b.height, .stride = b.stride, .format = b.format, .size = @intCast(b.data.len) };
+    }
+
+    pub fn retain(b: *Buffer) void {
+        b.pool.refs += 1;
+    }
+
+    pub fn release(b: *Buffer) void {
+        b.pool.release();
     }
 
     pub fn beginRead(b: *Buffer) wire.Error!void {
@@ -64,6 +74,7 @@ pub const Pool = struct {
     pending: usize = 0,
     failed: bool = false,
     hook: Hook,
+    refs: usize = 1,
 
     pub fn create(gpa: std.mem.Allocator, conn: *wire.Connection, manager: P.ZwpLinuxDmabufV1, dev: u64, width: u32, height: u32, format: u32, hook: Hook) wire.Error!*Pool {
         if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidArgument;
@@ -95,7 +106,7 @@ pub const Pool = struct {
                 c.gbm_bo_destroy(bo);
                 return error.Unsupported;
             }
-            b.* = .{ .bo = bo, .fd = dma_fd, .width = aw, .height = ah, .stride = stride, .format = format, .data = @as([*]u8, @ptrCast(mem))[0..len], .pool = pool };
+            b.* = .{ .id = next_buffer_id.fetchAdd(1, .monotonic), .bo = bo, .fd = dma_fd, .width = aw, .height = ah, .stride = stride, .format = format, .data = @as([*]u8, @ptrCast(mem))[0..len], .pool = pool };
             pool.count += 1;
             try sync(dma_fd, c.DMA_BUF_SYNC_START | c.DMA_BUF_SYNC_WRITE);
             @memset(b.data, 0);
@@ -111,9 +122,8 @@ pub const Pool = struct {
         return pool;
     }
 
-    fn destroyBuffers(pool: *Pool) void {
+    fn retireBuffers(pool: *Pool) void {
         for (pool.buffers[0..pool.count]) |*b| {
-            b.endRead() catch {};
             if (b.params) |p| {
                 if (b.requested) {
                     // A resize can retire a pool before created/failed arrives. Keep
@@ -121,7 +131,16 @@ pub const Pool = struct {
                     pool.conn.setHandler(p.id, wire.Handler.init(wire.Connection, pool.conn, discardParams));
                 } else p.destroy(pool.conn) catch {};
             }
+            b.params = null;
             if (b.proxy) |p| p.destroy(pool.conn) catch {};
+            b.proxy = null;
+        }
+    }
+
+    fn destroyBuffers(pool: *Pool) void {
+        pool.retireBuffers();
+        for (pool.buffers[0..pool.count]) |*b| {
+            b.endRead() catch {};
             _ = std.c.munmap(@ptrCast(@alignCast(b.data.ptr)), b.data.len);
             sys.close(b.fd);
             c.gbm_bo_destroy(b.bo);
@@ -129,6 +148,16 @@ pub const Pool = struct {
     }
 
     pub fn destroy(pool: *Pool) void {
+        // Only the capture owner owns protocol objects. Retained CPU references
+        // can outlive the Wayland client, but keep no callbacks into that client.
+        pool.retireBuffers();
+        pool.release();
+    }
+
+    fn release(pool: *Pool) void {
+        std.debug.assert(pool.refs > 0);
+        pool.refs -= 1;
+        if (pool.refs != 0) return;
         pool.destroyBuffers();
         c.gbm_device_destroy(pool.device);
         sys.close(pool.drm_fd);

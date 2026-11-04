@@ -194,6 +194,9 @@ pub const Conn = struct {
     }
 
     pub fn deinit(self: *Conn) void {
+        // Capture references must be released while their Wayland connection is alive.
+        self.ch.surf.clearDmaReference();
+        for (&self.surfaces.slots) |*slot| if (slot.*) |*s| s.surf.clearDmaReference();
         self.wipeSecret();
         self.lingering = self.mayLinger();
         // The features first: they may use the desktop.
@@ -1194,6 +1197,7 @@ pub const Conn = struct {
                 self.odd_size_since_ms = since;
                 if (now - since < self.odd_size_grace_ms) {
                     log.debug("{s}: skipping a {d}x{d} frame (the session is {d}x{d})", .{ self.peer, f.width, f.height, d.width(), d.height() });
+                    try self.ch.surf.finishCapture(self.gpa, f.dma);
                     return d.requestFrame();
                 }
                 if (!self.odd_size_taken) {
@@ -1209,6 +1213,7 @@ pub const Conn = struct {
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame with stride {d} and {d} bytes", .{ self.peer, f.width, f.height, f.stride, f.data.len }),
                 else => return err,
             };
+            try self.ch.surf.finishCapture(self.gpa, f.dma);
             try d.requestFrame();
         }
         if (self.secret) |sec| {

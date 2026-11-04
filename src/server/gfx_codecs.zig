@@ -46,6 +46,7 @@ pub const Surface = struct {
     dma_frame: ?*@import("../wl/dmabuf.zig").Buffer = null,
     dma_encode_off: bool = false,
     dma_encode_seen: bool = false,
+    dma_reference: ?struct { buffer: *@import("../wl/dmabuf.zig").Buffer, width: u32, height: u32 } = null,
     /// AVC420, or AVC444 when opts.avc444 is set.
     h264: ?vaapi_h264.Encoder = null,
     h264_out: std.ArrayList(u8) = .empty,
@@ -92,6 +93,7 @@ pub const Surface = struct {
     planar_bytes_per_piece: usize = 0,
 
     pub fn deinit(s: *Surface, gpa: std.mem.Allocator) void {
+        s.clearDmaReference();
         if (s.h264) |*h| h.deinit();
         if (s.prog) |*p| p.deinit();
         for (&s.rfx) |*r| if (r.*) |*e| e.deinit();
@@ -117,6 +119,7 @@ pub const Surface = struct {
 
     /// The client's decoder state for a (re)created surface is gone (3.3.1.6); ours goes too.
     pub fn reset(s: *Surface) void {
+        s.clearDmaReference();
         s.need_idr = true;
         @memset(s.ref_qp, no_ref);
         s.h264_src_ok = false;
@@ -130,6 +133,43 @@ pub const Surface = struct {
             e.deinit();
             r.* = null;
         };
+    }
+
+    pub fn clearDmaReference(s: *Surface) void {
+        if (s.dma_reference) |ref| ref.buffer.release();
+        s.dma_reference = null;
+    }
+
+    pub fn rememberDmaReference(s: *Surface, buffer: *@import("../wl/dmabuf.zig").Buffer, width: u32, height: u32) void {
+        buffer.retain();
+        s.clearDmaReference();
+        s.dma_reference = .{ .buffer = buffer, .width = width, .height = height };
+        s.h264_src_ok = false;
+    }
+
+    fn ensureH264Source(s: *Surface, gpa: std.mem.Allocator, len: usize) !void {
+        if (s.h264_src.len == len) return;
+        const next = try gpa.alloc(u8, len);
+        gpa.free(s.h264_src);
+        s.h264_src = next;
+        s.h264_src_ok = false;
+    }
+
+    pub fn materializeDmaReference(s: *Surface, gpa: std.mem.Allocator) !void {
+        const ref = s.dma_reference orelse return;
+        const row = @as(usize, ref.width) * 4;
+        try s.ensureH264Source(gpa, row * ref.height);
+        try ref.buffer.beginRead();
+        for (0..ref.height) |y| @memcpy(s.h264_src[y * row ..][0..row], ref.buffer.data[y * ref.buffer.stride ..][0..row]);
+        try ref.buffer.endRead();
+        s.h264_src_ok = true;
+        s.clearDmaReference();
+    }
+
+    /// Before capture reuses the older buffer, preserve it if this frame did not replace it.
+    pub fn finishCapture(s: *Surface, gpa: std.mem.Allocator, current: ?*@import("../wl/dmabuf.zig").Buffer) !void {
+        if (s.dma_reference) |ref| if (ref.buffer != current) try s.materializeDmaReference(gpa);
+        if (current == null) if (s.h264) |*h| h.clearDmaCache();
     }
 };
 
@@ -392,12 +432,8 @@ test "DMA-BUF encode needs the whole picture, without gaps or overlaps" {
 fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
     const s = &c.ch.surf;
     const e = &c.enc;
-    if (s.h264_src.len != e.shadow.len) {
-        c.gpa.free(s.h264_src);
-        s.h264_src = &.{};
-        s.h264_src = try c.gpa.alloc(u8, e.shadow.len);
-        s.h264_src_ok = false;
-    }
+    try s.materializeDmaReference(c.gpa);
+    try s.ensureH264Source(c.gpa, e.shadow.len);
     if (!s.h264_src_ok) {
         @memcpy(s.h264_src, e.shadow);
         s.h264_src_ok = true;
@@ -415,6 +451,30 @@ fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
         }
     }
     return s.h264_src;
+}
+
+test "CPU H.264 source preserves pixels outside selected macroblocks for refinement" {
+    const gpa = std.testing.allocator;
+    var c: Conn = undefined;
+    c.gpa = gpa;
+    c.enc = encoder_mod.Encoder.init(gpa);
+    defer c.enc.deinit();
+    c.ch.surf = .{};
+    defer c.ch.surf.deinit(gpa);
+    try c.enc.reset(32, 16);
+    @memset(c.enc.shadow, 9);
+    try c.ch.surf.ensureH264Source(gpa, c.enc.shadow.len);
+    @memset(c.ch.surf.h264_src, 1);
+    c.ch.surf.h264_src_ok = true;
+    const source = try h264Source(&c, &.{.{ .left = 0, .top = 0, .right = 16, .bottom = 16 }});
+    for (0..16) |y| {
+        for (source[y * 128 ..][0..64]) |byte| try std.testing.expectEqual(@as(u8, 9), byte);
+        for (source[y * 128 + 64 ..][0..64]) |byte| try std.testing.expectEqual(@as(u8, 1), byte);
+    }
+    @memset(c.enc.shadow, 7);
+    const refine = try h264Source(&c, &.{});
+    try std.testing.expectEqual(@as(u8, 9), refine[0]);
+    try std.testing.expectEqual(@as(u8, 1), refine[64]);
 }
 
 fn writeMotion(c: *Conn, w: *bytes.Writer, sid: u16, m: policy.Motion) !Sent {
@@ -438,6 +498,7 @@ fn dropCodec(c: *Conn, w: *bytes.Writer, sid: u16, m: policy.Motion, err: anyerr
     c.ch.codec_off.insert(m);
     switch (m) {
         .avc444v2, .avc420 => {
+            s.clearDmaReference();
             if (s.h264) |*h| h.deinit();
             s.h264 = null;
             s.need_idr = true;
@@ -624,14 +685,15 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     if (s.avc_region.items.len == 0) return error.NothingToRefine;
     h.setQp(qp);
     s.h264_out.clearRetainingCapacity();
-    const src = try h264Source(c, content);
     const mbs = if (idr) dirty_mbs else dirty_mbs + refinedMbs(c, qp);
     const dma = if (!s.dma_encode_off and coversFrame(content, width, height)) s.dma_frame else null;
     const info = if (dma) |buffer| h.encodeDmaBuf(buffer.descriptor(), s.need_idr, &s.h264_out) catch |err| blk: {
         log.info("DMA-BUF encode unavailable ({t}); using CPU upload", .{err});
         s.dma_encode_off = true;
+        const src = try h264Source(c, content);
         break :blk try h.encode(src, c.enc.shadowStride(), true, &s.h264_out);
-    } else try h.encode(src, c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    } else try h.encode(try h264Source(c, content), c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    if (dma) |buffer| if (!s.dma_encode_off) s.rememberDmaReference(buffer, width, height);
     if (dma != null and !s.dma_encode_off and !s.dma_encode_seen) {
         s.dma_encode_seen = true;
         log.info("H.264 directly imports the capture DMA-BUF for whole-picture updates", .{});

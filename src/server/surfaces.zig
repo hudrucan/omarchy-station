@@ -205,6 +205,7 @@ pub fn pump(c: *Conn, d: *Desktop) Error!bool {
         // A frame not of the output's mode (capture renegotiating after a relayout).
         if (uprightWidth(f) != info.width or uprightHeight(f) != info.height) {
             log.debug("{s}: skipping a {d}x{d} frame of {s} ({d}x{d})", .{ c.peer, f.width, f.height, info.name, info.width, info.height });
+            try c.surfaces.slots[i].?.surf.finishCapture(c.gpa, f.dma);
             try src.request();
             continue;
         }
@@ -216,6 +217,7 @@ pub fn pump(c: *Conn, d: *Desktop) Error!bool {
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame of {s} with stride {d} and {d} bytes", .{ c.peer, f.width, f.height, info.name, f.stride, f.data.len }),
                 else => return err,
             };
+            try c.ch.surf.finishCapture(c.gpa, f.dma);
         }
         try src.request();
         c.surfaces.slots[i].?.awaiting = false;
@@ -254,6 +256,7 @@ fn pumpComposite(c: *Conn, d: *Desktop) Error!bool {
         s.composite_h = dh;
     }
     const plan = d.sessionPlan();
+    try c.ch.surf.finishCapture(c.gpa, null);
     var any = false;
     for (0..plan.count) |i| {
         const src = d.frameSource(i);

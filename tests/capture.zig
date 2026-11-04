@@ -41,6 +41,19 @@ pub fn main(init: std.process.Init) !void {
         } else {
             if (frame.dma == null) return error.DmaBufNotSelected;
             if (!std.mem.eql(u8, reference, rgb)) return error.DmaBufPixelMismatch;
+            var source: oma.server.gfx_codecs.Surface = .{};
+            defer source.deinit(gpa);
+            source.rememberDmaReference(frame.dma.?, frame.width, frame.height);
+            try source.finishCapture(gpa, frame.dma);
+            if (source.h264_src.len != 0) return error.UnnecessaryCpuSnapshot;
+            try source.finishCapture(gpa, null);
+            if (!source.h264_src_ok or source.dma_reference != null) return error.MissingCpuSnapshot;
+            for (0..frame.height) |y| for (0..frame.width) |x| {
+                const src = (y * frame.width + x) * 4;
+                const dst = (y * frame.width + x) * 3;
+                if (!std.mem.eql(u8, source.h264_src[src..][0..3], rgb[dst..][0..3])) return error.BadCpuReference;
+            };
+            source.rememberDmaReference(frame.dma.?, frame.width, frame.height);
             try frame.dma.?.endRead();
             var encoder = try oma.codec.vaapi_h264.Encoder.init(gpa, .{ .width = frame.width, .height = frame.height, .crop = frame.width % 2 == 0 and frame.height % 2 == 0 });
             defer encoder.deinit();
@@ -62,6 +75,20 @@ pub fn main(init: std.process.Init) !void {
                 }
                 std.debug.print("Static-frame {s}: {d:.2} ms/frame\n", .{ if (direct) "DMA-BUF import" else "CPU upload", @as(f64, @floatFromInt(nowNs() - start)) / 30e6 });
             }
+            if (encoder.dma_imports != 1 or encoder.dma_cache_hits != 30) return error.DmaCacheNotReused;
+            const other = &frame.dma.?.pool.buffers[1];
+            if (other.id == frame.dma.?.id) return error.ReusedAllocationIdentity;
+            bitstream.clearRetainingCapacity();
+            _ = try encoder.encodeDmaBuf(other.descriptor(), false, &bitstream);
+            bitstream.clearRetainingCapacity();
+            _ = try encoder.encodeDmaBuf(frame.dma.?.descriptor(), false, &bitstream);
+            if (encoder.dma_imports != 2 or encoder.dma_cache_hits != 31) return error.DmaDoubleBufferCacheMiss;
+            var replaced = frame.dma.?.descriptor();
+            replaced.id += 0x100000000;
+            bitstream.clearRetainingCapacity();
+            _ = try encoder.encodeDmaBuf(replaced, false, &bitstream);
+            if (encoder.dma_imports != 3) return error.StaleDmaAllocationReused;
+            std.debug.print("DMA-BUF cache: 31 hits, two allocations reused, replacement identity reimported\n", .{});
             if (init.environ_map.get("OMASTATION_CAPTURE_TEST_ALLOW_RESIZE") != null) {
                 const runtime = init.environ_map.get("XDG_RUNTIME_DIR") orelse return error.UnsafeTestEnvironment;
                 if (!std.mem.startsWith(u8, runtime, "/tmp/")) return error.UnsafeTestEnvironment;
@@ -88,7 +115,17 @@ pub fn main(init: std.process.Init) !void {
                 try held.dma.?.endRead();
                 const resized = capture.takeFrame() orelse return error.ResizedFrameMissing;
                 if (resized.width != 960 or resized.height != 641 or resized.dma == null or capture.retired != null) return error.BadResizedFrame;
+                try source.materializeDmaReference(gpa);
+                for (0..held.height) |y| for (0..held.width) |x| {
+                    const src = (y * held.width + x) * 4;
+                    const dst = (y * held.width + x) * 3;
+                    if (!std.mem.eql(u8, source.h264_src[src..][0..3], rgb[dst..][0..3])) return error.RetiredReferenceChanged;
+                };
                 try resized.dma.?.endRead();
+                try encoder.resize(960, 640);
+                if (encoder.dma_imports != 0 or encoder.dma_cache_hits != 0) return error.DmaCacheSurvivedResize;
+                bitstream.clearRetainingCapacity();
+                _ = try encoder.encodeDmaBuf(resized.dma.?.descriptor(), true, &bitstream);
                 var resized_encoder = try oma.codec.vaapi_h264.Encoder.init(gpa, .{ .width = resized.width, .height = resized.height, .crop = false });
                 defer resized_encoder.deinit();
                 bitstream.clearRetainingCapacity();
@@ -97,4 +134,25 @@ pub fn main(init: std.process.Init) !void {
             }
         }
     }
+    var first_pixel: [3]u8 = undefined;
+    const retained = blk: {
+        const isolated_client = try oma.wl.Client.connect(gpa, .{});
+        defer isolated_client.deinit();
+        const isolated_output = for (isolated_client.output_list.items) |o| {
+            if (!o.removed and std.mem.eql(u8, o.name(), "BASE")) break o;
+        } else return error.TestOutputMissing;
+        const isolated_capture = try oma.wl.Capture.init(isolated_client, isolated_output, .{ .backend = .ext });
+        defer isolated_capture.deinit();
+        const f = try isolated_capture.nextFrame(5000);
+        const buffer = f.dma orelse return error.DmaBufNotSelected;
+        @memcpy(&first_pixel, f.data[0..3]);
+        try buffer.endRead();
+        buffer.retain();
+        break :blk buffer;
+    };
+    defer retained.release();
+    try retained.beginRead();
+    if (!std.mem.eql(u8, &first_pixel, retained.data[0..3])) return error.DetachedBufferChanged;
+    try retained.endRead();
+    std.debug.print("DMA-BUF retained storage survives capture and Wayland-client teardown\n", .{});
 }

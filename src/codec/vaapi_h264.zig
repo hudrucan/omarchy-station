@@ -113,6 +113,10 @@ pub const Encoder = struct {
     view_derived: [2]bool = .{ false, false },
     scratch: []u8 = &.{},
     coded_buf: c.VABufferID = c.VA_INVALID_ID,
+    dma_surfaces: [2]DmaSurface = .{ .{}, .{} },
+    dma_next: usize = 0,
+    dma_imports: u64 = 0,
+    dma_cache_hits: u64 = 0,
 
     bitrate: u32,
     rc_dirty: bool = true,
@@ -124,6 +128,18 @@ pub const Encoder = struct {
     /// Parameter sets of the stream as emitted by the driver.
     params: bs.ParamSets = .{},
     hdr: std.ArrayList(u8) = .empty,
+
+    const DmaSurface = struct {
+        frame: ?dmabuf.Frame = null,
+        surface: c.VASurfaceID = c.VA_INVALID_ID,
+        fd: c_int = -1,
+
+        fn deinit(s: *DmaSurface, dpy: c.VADisplay) void {
+            if (s.surface != c.VA_INVALID_ID) _ = c.vaDestroySurfaces(dpy, &s.surface, 1);
+            if (s.fd >= 0) _ = c.close(s.fd);
+            s.* = .{};
+        }
+    };
 
     const src_surface = 0;
     const nv12_surface = 1;
@@ -319,13 +335,40 @@ pub const Encoder = struct {
         return info;
     }
 
-    /// Import capture storage directly; encoding completes before releasing the surface.
+    /// Cache the two capture allocations. Unknown identities remain one-shot imports.
     pub fn encodeDmaBuf(self: *Encoder, buffer: dmabuf.Frame, force_idr: bool, out: *std.ArrayList(u8)) Error!FrameInfo {
         if (self.opts.avc444 != null or buffer.fd < 0 or
             buffer.width < (self.opts.width + 15) & ~@as(u32, 15) or
             buffer.height < (self.opts.height + 15) & ~@as(u32, 15) or
             @as(u64, buffer.stride) < @as(u64, buffer.width) * 4 or
             @as(u64, buffer.size) < @as(u64, buffer.stride) * buffer.height) return error.BadInput;
+        if (buffer.id == 0) {
+            var surface = try self.importDmaSurface(buffer);
+            defer _ = c.vaDestroySurfaces(self.dpy, &surface, 1);
+            return self.encodeSurface(surface, force_idr, out);
+        }
+        for (&self.dma_surfaces) |*entry| if (entry.frame) |key| {
+            if (std.meta.eql(key, buffer)) {
+                self.dma_cache_hits += 1;
+                return self.encodeSurface(entry.surface, force_idr, out);
+            }
+        };
+        const owned_fd = c.fcntl(buffer.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
+        if (owned_fd < 0) return error.Vaapi;
+        var owned = buffer;
+        owned.fd = owned_fd;
+        const surface = self.importDmaSurface(owned) catch |err| {
+            _ = c.close(owned_fd);
+            return err;
+        };
+        const entry = &self.dma_surfaces[self.dma_next];
+        entry.deinit(self.dpy);
+        entry.* = .{ .frame = buffer, .surface = surface, .fd = owned_fd };
+        self.dma_next = (self.dma_next + 1) % self.dma_surfaces.len;
+        return self.encodeSurface(surface, force_idr, out);
+    }
+
+    fn importDmaSurface(self: *Encoder, buffer: dmabuf.Frame) Error!c.VASurfaceID {
         var desc = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
         desc.fourcc = if (buffer.format == dmabuf.xrgb8888) c.VA_FOURCC_BGRX else if (buffer.format == dmabuf.argb8888) c.VA_FOURCC_BGRA else return error.BadInput;
         desc.width = buffer.width;
@@ -344,8 +387,8 @@ pub const Encoder = struct {
         };
         var surface: c.VASurfaceID = c.VA_INVALID_ID;
         try vaCheck(c.vaCreateSurfaces(self.dpy, c.VA_RT_FORMAT_RGB32, buffer.width, buffer.height, &surface, 1, &attrs, attrs.len), "vaCreateSurfaces(DMA-BUF)");
-        defer _ = c.vaDestroySurfaces(self.dpy, &surface, 1);
-        return self.encodeSurface(surface, force_idr, out);
+        self.dma_imports += 1;
+        return surface;
     }
 
     /// Codes the views `lc` asks for (MS-RDPEGFX 2.2.4.5), each into its own list. An IDR
@@ -673,6 +716,7 @@ pub const Encoder = struct {
     }
 
     fn releaseVa(e: *Encoder) void {
+        e.clearDmaCache();
         if (e.image.image_id != c.VA_INVALID_ID) _ = c.vaDestroyImage(e.dpy, e.image.image_id);
         e.image.image_id = c.VA_INVALID_ID;
         for (&e.view_images) |*img| {
@@ -695,6 +739,11 @@ pub const Encoder = struct {
             if (s.* != c.VA_INVALID_SURFACE) _ = c.vaDestroySurfaces(e.dpy, s, 1);
             s.* = c.VA_INVALID_SURFACE;
         }
+    }
+
+    pub fn clearDmaCache(e: *Encoder) void {
+        for (&e.dma_surfaces) |*entry| entry.deinit(e.dpy);
+        e.dma_next = 0;
     }
 
     fn hasEntrypoint(e: *Encoder, profile: c.VAProfile, entrypoint: c.VAEntrypoint) bool {
