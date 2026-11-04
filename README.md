@@ -74,6 +74,11 @@ The session-bound service needs a running Hyprland desktop. For remote login
 before the desktop starts, use [on-demand login](docs/login.md); it replaces the
 session-bound listener on the same port.
 
+For clipboard file transfers, copy files or folders in Finder/Explorer and paste
+them into Files on the remote desktop. Folder contents and empty subfolders are
+preserved. The client must support clipboard file streaming; copied image data
+uses the separate image clipboard formats.
+
 ## Configure
 
 `omastation --help` lists server options. The packaged service runs

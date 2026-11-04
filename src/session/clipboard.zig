@@ -762,6 +762,13 @@ pub const Bridge = struct {
         b.dropCache();
         try b.retireTree();
         const offers = try cliprdr.offersForRemoteFormats(b.gpa, formats, b.srv.negotiatedFlags());
+        if (b.srv.remoteFormatId(cliprdr.name_file_group_descriptor_w)) |id| {
+            log.info("client file clipboard: format {d}, streaming={}, {d} desktop formats", .{
+                id,
+                b.srv.negotiatedFlags() & cliprdr.CB_STREAM_FILECLIP_ENABLED != 0,
+                offers.len,
+            });
+        }
         b.gpa.free(b.offers);
         b.offers = offers;
         b.announced = false;
@@ -1782,6 +1789,100 @@ test "Messages splits back-to-back PDUs" {
     var cut: Messages = .{ .rest = two[0..12] };
     _ = cut.next();
     try std.testing.expect(cut.next() == null);
+}
+
+test "clipboard: incoming files are staged across chunks, empty files and directories" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    var template = "/tmp/oma-clip-XXXXXX".*;
+    const root = libc.mkdtemp(&template) orelse return error.TestUnexpectedResult;
+    defer _ = libc.rmdir(root);
+    const b = try Bridge.create(gpa, null, .{
+        .io = std.Io.Threaded.global_single_threaded.io(),
+        .active = true,
+        .staging_root = std.mem.span(root),
+        .file_chunk_len = 3,
+    });
+    defer b.destroy();
+    var msg: std.ArrayList(u8) = .empty;
+    defer msg.deinit(gpa);
+    var w = bytes.Writer.init(&msg, gpa);
+    try cliprdr.encodeCaps(&w, .{ .flags = cliprdr.all_general_flags });
+    try b.handleMessage(msg.items);
+    msg.clearRetainingCapacity();
+    // Registered IDs are assigned by the peer OS, not necessarily in Windows' range.
+    const format: cliprdr.Format = .{ .id = 0x1234, .name = cliprdr.name_file_group_descriptor_w };
+    try cliprdr.encodeFormatList(&w, &.{format}, .long);
+    try b.handleMessage(msg.items);
+    try testing.expectEqual(@as(usize, 2), b.offers.len);
+    try testing.expectEqualStrings(cliprdr.mime_uri_list, b.offers[0].mime);
+    try testing.expectEqualStrings(cliprdr.mime_gnome_copied_files, b.offers[1].mime);
+    try testing.expectEqual(format.id, b.offers[0].format_id);
+    b.clearOutgoing();
+    const owned = try OwnedFormat.init(gpa, format);
+    defer owned.deinit(gpa);
+    try testing.expect(try b.startStaging(owned));
+    b.clearOutgoing();
+
+    const files = [_]cliprdr.FileDescriptor{
+        .{ .name = "folder", .attributes = cliprdr.FILE_ATTRIBUTE_DIRECTORY },
+        .{ .name = "folder\\known.txt", .size = 7 },
+        .{ .name = "empty.txt", .size = 0 },
+        .{ .name = "unknown.txt", .flags = cliprdr.FD_ATTRIBUTES },
+        .{ .name = "folder\\empty", .attributes = cliprdr.FILE_ATTRIBUTE_DIRECTORY },
+        .{ .name = "folder\\nested", .attributes = cliprdr.FILE_ATTRIBUTE_DIRECTORY },
+        .{ .name = "folder\\nested\\document.md", .size = 4 },
+    };
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var lw = bytes.Writer.init(&list, gpa);
+    try cliprdr.encodeFileList(&lw, &files, cliprdr.all_general_flags);
+    msg.clearRetainingCapacity();
+    try cliprdr.encodeFormatDataResponse(&w, list.items);
+    try b.handleMessage(msg.items);
+    const contents = [_][]const u8{ "", "abcdefg", "", "xyz12", "", "", "# hi" };
+    var iterations: usize = 0;
+    while (b.staged == null and iterations < 12) : (iterations += 1) {
+        var messages: Messages = .{ .rest = b.outgoing() };
+        const request = try cliprdr.decodeFileContentsRequest(messages.next() orelse return error.TestUnexpectedResult);
+        try testing.expect(messages.next() == null);
+        try testing.expect(request.lindex == 1 or request.lindex == 3 or request.lindex == 6);
+        try testing.expect(request.clip_data_id != null);
+        if (request.lindex != 3) try testing.expectEqual(cliprdr.FILECONTENTS_RANGE, request.flags);
+        const content = contents[@intCast(request.lindex)];
+        b.clearOutgoing();
+        msg.clearRetainingCapacity();
+        if (request.flags == cliprdr.FILECONTENTS_SIZE) {
+            try cliprdr.encodeFileSizeResponse(&w, request.stream_id, content.len);
+        } else {
+            try testing.expect(request.position < content.len);
+            const offset: usize = @intCast(request.position);
+            const end = @min(content.len, offset + request.cb_requested);
+            try cliprdr.encodeFileContentsResponse(&w, request.stream_id, content[offset..end]);
+        }
+        try b.handleMessage(msg.items);
+    }
+    const staged = b.staged orelse return error.TestUnexpectedResult;
+    for ([_][]const u8{ "folder/known.txt", "empty.txt", "unknown.txt", "folder/nested/document.md" }, [_]usize{ 1, 2, 3, 6 }) |name, index| {
+        const file_path = try std.fs.path.join(gpa, &.{ staged.dir, name });
+        defer gpa.free(file_path);
+        const data = try std.Io.Dir.cwd().readFileAlloc(b.opts.io, file_path, gpa, .limited(64));
+        defer gpa.free(data);
+        try testing.expectEqualStrings(contents[index], data);
+    }
+    const empty_path = try std.fs.path.join(gpa, &.{ staged.dir, "folder/empty" });
+    defer gpa.free(empty_path);
+    var empty_dir = try std.Io.Dir.cwd().openDir(b.opts.io, empty_path, .{ .iterate = true });
+    defer empty_dir.close(b.opts.io);
+    var iterator = empty_dir.iterate();
+    try testing.expect(try iterator.next(b.opts.io) == null);
+    const uris = try cliprdr.parseUriList(gpa, staged.uri_list);
+    defer uris.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), uris.paths.len);
+    const gnome = try cliprdr.parseGnomeCopiedFiles(gpa, staged.gnome);
+    defer gnome.list.deinit(gpa);
+    try testing.expect(!gnome.cut);
+    try testing.expectEqual(@as(usize, 3), gnome.list.paths.len);
 }
 
 test {
