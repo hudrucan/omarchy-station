@@ -1539,6 +1539,15 @@ pub const Desktop = struct {
         return d.frameSource(0).take();
     }
 
+    pub fn latestFrame(d: *Desktop) ?wl.capture.PendingFrame {
+        const cap = d.captureAt(0) orelse return null;
+        return cap.latestFrame();
+    }
+
+    pub fn consumeFrame(d: *Desktop) void {
+        if (d.captureAt(0)) |cap| cap.consumeFrame();
+    }
+
     pub fn frameReady(d: *const Desktop) bool {
         const cap = d.capture orelse return false;
         return cap.ready_idx != null;

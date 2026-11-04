@@ -64,6 +64,12 @@ Each five-second interval retains at most its latest 512 latency samples; frames
 without a valid presentation timestamp are omitted. This helps compare latency
 when both builds already reach the display's frame rate.
 
+The same log counts input events serviced during bounded VA-API waits and stale
+captures replaced before encoding. Capture can run one frame ahead once the
+previous RGB reference is safe to reuse. The latest unencoded picture is retained
+under backpressure, including the final picture when the screen stops changing;
+encoded H.264 pictures are never dropped. Control PDUs remain ordered with input.
+
 For fewer parallel jobs or another build location:
 
 ```sh

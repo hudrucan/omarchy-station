@@ -24,6 +24,9 @@ pub const ColorConversion = enum {
     fused,
 };
 
+/// Called on the encoder's thread between bounded GPU waits; must not reenter the encoder.
+pub const WaitHook = struct { ctx: *anyopaque, func: *const fn (*anyopaque) void };
+
 pub const Options = struct {
     width: u32,
     height: u32,
@@ -54,6 +57,7 @@ pub const Options = struct {
     /// AVC444 view packing (`encode444`), coded at avc444.viewSize without cropping;
     /// null is AVC420 (`encode`).
     avc444: ?avc444.Version = null,
+    wait_hook: ?WaitHook = null,
 };
 
 /// The pictures `encode444` coded (null: that view was not coded).
@@ -466,10 +470,13 @@ pub const Encoder = struct {
 
         var bufs = BufList{ .dpy = self.dpy, .ctx = self.enc_ctx, .optional_processing = fused != null };
         defer bufs.destroy();
+        var region = self.pictureRegion();
+        var additional = [1]c.VASurfaceID{input};
 
         if (fused) |src| {
-            var additional = [1]c.VASurfaceID{input};
             var pp = pipelineParams(src);
+            pp.surface_region = &region;
+            pp.output_region = &region;
             pp.additional_outputs = &additional;
             pp.num_additional_outputs = 1;
             try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
@@ -561,10 +568,7 @@ pub const Encoder = struct {
         try vaCheck(rs, "vaRenderPicture(encode)");
         try vaCheck(es, "vaEndPicture(encode)");
 
-        const st = c.vaSyncBuffer(self.dpy, self.coded_buf, sync_timeout_ns);
-        if (st == c.VA_STATUS_ERROR_UNIMPLEMENTED) {
-            try vaCheck(c.vaSyncSurface(self.dpy, target), "vaSyncSurface");
-        } else try vaCheck(st, "vaSyncBuffer");
+        try self.syncPicture(target);
 
         const driver_qp = try self.readCoded(out);
         const size = out.items.len - start;
@@ -597,6 +601,29 @@ pub const Encoder = struct {
             .encode_ns = nowNs() - t0,
             .total_ns = nowNs() - t0,
         };
+    }
+
+    fn syncPicture(self: *Encoder, target: c.VASurfaceID) Error!void {
+        const hook = self.opts.wait_hook;
+        const deadline = nowNs() + sync_timeout_ns;
+        var buffer_sync = true;
+        while (true) {
+            if (hook) |h| h.func(h.ctx);
+            const left = deadline -| nowNs();
+            const timeout = if (hook != null) @min(left, std.time.ns_per_ms) else left;
+            var st = if (buffer_sync) c.vaSyncBuffer(self.dpy, self.coded_buf, timeout) else c.vaSyncSurface2(self.dpy, target, timeout);
+            if (st == c.VA_STATUS_ERROR_UNIMPLEMENTED) {
+                if (buffer_sync) {
+                    buffer_sync = false;
+                    continue;
+                }
+                // Older drivers retain their original blocking synchronization path.
+                st = c.vaSyncSurface(self.dpy, target);
+            }
+            if (st == c.VA_STATUS_ERROR_TIMEDOUT and nowNs() < deadline) continue;
+            try vaCheck(st, if (buffer_sync) "vaSyncBuffer" else "vaSyncSurface");
+            return;
+        }
     }
 
     /// Pictures between reference `r` and the current one; frame_num wraps at `max_frame_num`.
@@ -854,13 +881,21 @@ pub const Encoder = struct {
     fn convert(self: *Encoder, src: c.VASurfaceID) Error!void {
         var bufs = BufList{ .dpy = self.dpy, .ctx = self.vpp_ctx };
         defer bufs.destroy();
+        var region = self.pictureRegion();
         var pp = pipelineParams(src);
+        // Imported allocations are 16-aligned; scale only the logical picture, not its padding.
+        pp.surface_region = &region;
+        pp.output_region = &region;
         try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
         try vaCheck(c.vaBeginPicture(self.dpy, self.vpp_ctx, self.surfaces[nv12_surface]), "vaBeginPicture(vpp)");
         const rs = c.vaRenderPicture(self.dpy, self.vpp_ctx, &bufs.ids, @intCast(bufs.n));
         const es = c.vaEndPicture(self.dpy, self.vpp_ctx);
         try vaCheck(rs, "vaRenderPicture(vpp)");
         try vaCheck(es, "vaEndPicture(vpp)");
+    }
+
+    fn pictureRegion(self: *const Encoder) c.VARectangle {
+        return .{ .x = 0, .y = 0, .width = @intCast(self.opts.width), .height = @intCast(self.opts.height) };
     }
 
     /// Full-range BT.709 matrix only (MS-RDPEGFX 3.3.8.3.1), no transfer-function conversion.
@@ -1168,6 +1203,104 @@ fn fillTestFrame(buf: []u8, w: u32, h: u32, frame: u32) void {
         const in_box = x >= frame * 8 and x < frame * 8 + 64 and y >= 40 and y < 104;
         p.* = if (in_box) .{ 0x20, 0x40, 0xe0, 0 } else .{ @truncate(x), @truncate(y), @truncate(x ^ y), 0 };
     };
+}
+
+fn readTestNv12(e: *Encoder) ![]u8 {
+    try vaCheck(c.vaSyncSurface(e.dpy, e.surfaces[Encoder.nv12_surface]), "vaSyncSurface(test)");
+    var img: c.VAImage = undefined;
+    if (c.vaDeriveImage(e.dpy, e.surfaces[Encoder.nv12_surface], &img) != c.VA_STATUS_SUCCESS) return error.SkipZigTest;
+    defer _ = c.vaDestroyImage(e.dpy, img.image_id);
+    if (img.format.fourcc != c.VA_FOURCC_NV12) return error.SkipZigTest;
+    var ptr: ?*anyopaque = null;
+    try vaCheck(c.vaMapBuffer(e.dpy, img.buf, &ptr), "vaMapBuffer(test)");
+    defer _ = c.vaUnmapBuffer(e.dpy, img.buf);
+    const base: [*]const u8 = @ptrCast(ptr orelse return error.Vaapi);
+    const w: usize = e.opts.width;
+    const h: usize = e.opts.height;
+    // Compare all visible luma and the chroma blocks wholly inside an odd-sized picture.
+    const uv_width = w & ~@as(usize, 1);
+    const result = try e.gpa.alloc(u8, w * h + uv_width * (h / 2));
+    for (0..h) |y| @memcpy(result[y * w ..][0..w], base[img.offsets[0] + y * img.pitches[0] ..][0..w]);
+    for (0..h / 2) |y| @memcpy(result[w * h + y * uv_width ..][0..uv_width], base[img.offsets[1] + y * img.pitches[1] ..][0..uv_width]);
+    return result;
+}
+
+test "GPU: padded RGB imports preserve logical pixel coordinates" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_][2]u32{ .{ 978, 644 }, .{ 1000, 641 } }) |size| {
+        const w = size[0];
+        const h = size[1];
+        const pw = (w + 15) & ~@as(u32, 15);
+        const ph = (h + 15) & ~@as(u32, 15);
+        var enc = try Encoder.init(gpa, .{ .width = w, .height = h, .crop = false, .rate_control = .cqp });
+        defer enc.deinit();
+        const pixels = try gpa.alloc(u8, w * h * 4);
+        defer gpa.free(pixels);
+        fillTestFrame(pixels, w, h, 3);
+        try enc.upload(pixels, w * 4);
+        try enc.convert(enc.surfaces[Encoder.src_surface]);
+        const expected = try readTestNv12(&enc);
+        defer gpa.free(expected);
+
+        var padded: [1]c.VASurfaceID = undefined;
+        try createSurfaces(enc.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, pw, ph, &padded);
+        defer _ = c.vaDestroySurfaces(enc.dpy, &padded, 1);
+        var fmt: c.VAImageFormat = .{ .fourcc = c.VA_FOURCC_BGRX, .byte_order = c.VA_LSB_FIRST, .bits_per_pixel = 32 };
+        var img: c.VAImage = undefined;
+        try vaCheck(c.vaCreateImage(enc.dpy, &fmt, @intCast(pw), @intCast(ph), &img), "vaCreateImage(padded test)");
+        defer _ = c.vaDestroyImage(enc.dpy, img.image_id);
+        var ptr: ?*anyopaque = null;
+        try vaCheck(c.vaMapBuffer(enc.dpy, img.buf, &ptr), "vaMapBuffer(padded test)");
+        const base: [*]u8 = @ptrCast(ptr orelse return error.Vaapi);
+        for (0..ph) |y| {
+            @memset(base[img.offsets[0] + y * img.pitches[0] ..][0 .. pw * 4], 0xff);
+            if (y < h) @memcpy(base[img.offsets[0] + y * img.pitches[0] ..][0 .. w * 4], pixels[y * w * 4 ..][0 .. w * 4]);
+        }
+        try vaCheck(c.vaUnmapBuffer(enc.dpy, img.buf), "vaUnmapBuffer(padded test)");
+        try vaCheck(c.vaPutImage(enc.dpy, padded[0], img.image_id, 0, 0, pw, ph, 0, 0, pw, ph), "vaPutImage(padded test)");
+        try enc.convert(padded[0]);
+        const actual = try readTestNv12(&enc);
+        defer gpa.free(actual);
+        var changed: usize = 0;
+        for (expected, actual) |a, b| changed += @intFromBool(a != b);
+        if (changed != 0) std.debug.print("VPP {d}x{d} from padded {d}x{d}: {d}/{d} bytes changed\n", .{ w, h, pw, ph, changed, expected.len });
+        try testing.expectEqual(@as(usize, 0), changed);
+    }
+}
+
+test "GPU: bounded waits service their owner while preserving valid access units" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Owner = struct {
+        calls: usize = 0,
+
+        fn service(ctx: *anyopaque) void {
+            const owner: *@This() = @ptrCast(@alignCast(ctx));
+            owner.calls += 1;
+        }
+    };
+    var owner: Owner = .{};
+    var enc = try Encoder.init(gpa, .{ .width = 978, .height = 644, .rate_control = .cqp, .verify = true, .wait_hook = .{ .ctx = &owner, .func = Owner.service } });
+    defer enc.deinit();
+    const pixels = try gpa.alloc(u8, 978 * 644 * 4);
+    defer gpa.free(pixels);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var params: bs.ParamSets = .{};
+    owner.calls = 0;
+    for (0..4) |i| {
+        fillTestFrame(pixels, 978, 644, @intCast(i));
+        out.clearRetainingCapacity();
+        const before = owner.calls;
+        const frame = try enc.encode(pixels, 978 * 4, false, &out);
+        try testing.expect(owner.calls > before);
+        const au = try bs.inspect(out.items, params);
+        params = au.params;
+        try testing.expectEqual(@as(u32, 1), au.pictures);
+        try testing.expectEqual(i == 0, frame.idr);
+        try testing.expectEqual(@as(u32, @intCast(i)), au.first_slice.?.frame_num);
+    }
 }
 
 test "GPU: VBR and CBR report bounded average QP across bitrate changes" {

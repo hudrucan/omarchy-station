@@ -60,6 +60,8 @@ pub const Stats = struct {
     dma_frames: u64 = 0,
     dma_partial_frames: u64 = 0,
     frame_latency: FrameLatency = .{},
+    encode_input_events: u64 = 0,
+    capture_replaced: u64 = 0,
 };
 
 const stats_interval_ms = 5000;
@@ -654,6 +656,7 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     // Lossy tiles elsewhere wait for this to be quiet while a region plays.
     if (changed_outside or region == null or owed) c.ch.surf.outside_ms = conn_mod.nowMs();
     const sent = try gfx_codecs.writeFrame(c, &w, sid, motion, region);
+    try c.prefetchCapture();
     // Quiet lossy tiles fill what the frame's budget leaves.
     try gfx_codecs.writeRefineWithin(c, &w, sid, list.items.len, gfx_codecs.quietMs(c));
     try gfx.writeEndFrame(&w, fid);
@@ -841,7 +844,7 @@ fn logStats(c: *Conn) void {
         std.fmt.bufPrint(&latency_buf, "p50 {d:.2} ms, p95 {d:.2} ms ({d} samples)", .{ ms(p.p50, 1), ms(p.p95, 1), st.frame_latency.count }) catch "?"
     else
         "n/a";
-    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444, {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks; DMA-BUF {d} frames ({d} partial); present->flush {s}", .{
+    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444, {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks; DMA-BUF {d} frames ({d} partial); present->flush {s}; {d} input events during GPU waits, {d} stale captures replaced", .{
         c.peer,
         f * 1000.0 / @as(f64, @floatFromInt(el)),
         st.avc_frames,
@@ -867,6 +870,8 @@ fn logStats(c: *Conn) void {
         st.dma_frames,
         st.dma_partial_frames,
         latency,
+        st.encode_input_events,
+        st.capture_replaced,
     });
     st.* = .{ .since_ms = now };
 }

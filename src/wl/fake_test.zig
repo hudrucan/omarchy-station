@@ -503,6 +503,61 @@ test "ext capture: double-buffered damage hints and resize against a fake compos
     }
 }
 
+test "latest capture keeps the final picture and replaces only unencoded pictures" {
+    var h = try Harness.start();
+    defer h.stop() catch |e| std.debug.panic("fake compositor: {t}", .{e});
+    const fake = h.fake;
+    fake.resize_at = 2;
+    fake.resize_to = .{ 40, 30 };
+    const out = h.client.findOutput("FAKE-1").?;
+    const cap = try capture.Capture.init(h.client, out, .{ .backend = .ext });
+    defer cap.deinit();
+    try cap.requestFrame();
+    for (0..20) |_| {
+        if (cap.ready_idx != null) break;
+        _ = try h.client.dispatchTimeout(500);
+    } else return error.TestTimeout;
+    const first = cap.latestFrame().?;
+    try testing.expect(!first.replaced);
+    const held = first.frame.*;
+    // With no replacement ready, a stalled client can still send its last picture.
+    try testing.expectEqual(held.seq, cap.latestFrame().?.frame.seq);
+    try cap.requestFrame();
+    try cap.requestFrame(); // A second request must not create a second in-flight capture.
+    for (0..20) |_| {
+        if (cap.ready_idx != null) break;
+        _ = try h.client.dispatchTimeout(500);
+    } else return error.TestTimeout;
+    try expectFrame(&held, fake.snapshots.items[0], fake.damages.items[0]);
+    const latest = cap.latestFrame().?;
+    try testing.expect(latest.replaced);
+    try testing.expect(!cap.want_frame);
+    try testing.expectEqual(@as(u64, 1), latest.frame.seq);
+    try expectFrame(latest.frame, fake.snapshots.items[1], fake.damages.items[1]);
+    const before_resize = latest.frame.*;
+    try cap.requestFrame();
+    for (0..20) |_| {
+        if (cap.ready_idx != null) break;
+        _ = try h.client.dispatchTimeout(500);
+    } else return error.TestTimeout;
+    try expectFrame(&before_resize, fake.snapshots.items[1], fake.damages.items[1]);
+    const resized = cap.latestFrame().?;
+    try testing.expect(resized.replaced);
+    try testing.expectEqual(@as(u32, 40), resized.frame.width);
+    try expectFrame(resized.frame, fake.snapshots.items[2], .{ .x = 0, .y = 0, .width = 40, .height = 30 });
+    const taken = cap.takeFrame().?; // Switching to the multi-output consumer loses no last picture.
+    try testing.expectEqual(@as(u64, 2), taken.seq);
+    try testing.expect(cap.latestFrame() == null);
+    try cap.requestFrame();
+    for (0..20) |_| {
+        if (cap.ready_idx != null) break;
+        _ = try h.client.dispatchTimeout(500);
+    } else return error.TestTimeout;
+    try testing.expect(!cap.latestFrame().?.replaced);
+    cap.consumeFrame();
+    try testing.expect(cap.latestFrame() == null);
+}
+
 test "wlr screencopy capture against a fake compositor" {
     var h = try Harness.start();
     defer h.stop() catch |e| std.debug.panic("fake compositor: {t}", .{e});

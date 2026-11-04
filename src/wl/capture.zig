@@ -102,6 +102,8 @@ pub const Frame = struct {
     seq: u64,
 };
 
+pub const PendingFrame = struct { frame: *const Frame, replaced: bool, age_ns: u64 };
+
 pub const Backend = enum { auto, ext, wlr };
 
 pub const Options = struct {
@@ -202,6 +204,8 @@ pub const Capture = struct {
     out_damage: Damage = .{},
     last_taken: ?[4]u32 = null, // width, height, stride, format
     seq: u64 = 0,
+    pending_frame: bool = false,
+    pending_since_ns: u64 = 0,
     on_ready: ?Hook = null,
 
     /// ext needs a roundtrip for the constraints before the first frame; requestFrame() works at once.
@@ -274,7 +278,16 @@ pub const Capture = struct {
 
     /// The completed frame, if any; it stays valid until the next call.
     pub fn takeFrame(cap: *Capture) ?*const Frame {
-        const idx = cap.ready_idx orelse return null;
+        const idx = cap.ready_idx orelse {
+            // A consumer switching from latest-frame mode must receive its held picture too.
+            if (!cap.pending_frame) return null;
+            cap.pending_frame = false;
+            if (cap.out.dma) |buffer| buffer.beginRead() catch {
+                cap.state = .failed;
+                return null;
+            };
+            return &cap.out;
+        };
         const set = cap.ready_set.?;
         cap.front = idx;
         cap.front_set = set;
@@ -306,7 +319,29 @@ pub const Capture = struct {
             .seq = cap.seq,
         };
         cap.seq += 1;
+        cap.pending_frame = false;
         return &cap.out;
+    }
+
+    /// Keep one unencoded picture available until consumed, replacing it only with a newer one.
+    /// Buffer replacement and capture teardown manage the slot with its pixels.
+    pub fn latestFrame(cap: *Capture) ?PendingFrame {
+        var replaced = false;
+        if (cap.ready_idx != null) {
+            replaced = cap.pending_frame;
+            _ = cap.takeFrame();
+            cap.pending_frame = true;
+            // Coalesced older requests are satisfied. Only the owner may prefetch after
+            // protecting the previous RGB reference from the next buffer reuse.
+            cap.want_frame = false;
+            cap.pending_since_ns = sys.nowNs();
+        }
+        if (!cap.pending_frame) return null;
+        return .{ .frame = &cap.out, .replaced = replaced, .age_ns = sys.nowNs() -| cap.pending_since_ns };
+    }
+
+    pub fn consumeFrame(cap: *Capture) void {
+        cap.pending_frame = false;
     }
 
     pub fn nextFrame(cap: *Capture, timeout_ms: i32) Error!*const Frame {

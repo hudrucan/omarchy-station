@@ -741,7 +741,7 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     };
     const r = nominal(c);
     if (s.h264 == null) {
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
+        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device, .wait_hook = .{ .ctx = c, .func = Conn.pumpEncodeInput } });
         s.need_idr = true;
         // The refinement wait is picked once, from the link's rate, as Windows' encoder does.
         const rate = c.flow.rate() * 8;
@@ -783,17 +783,21 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     const mbs = if (idr) dirty_mbs else dirty_mbs + refinedMbs(c, qp);
     try s.ensureSourceChanges(c.gpa, width, height);
     const dma = if (!s.dma_encode_off and dmaSourceMatches(c, content)) s.dma_frame else null;
+    // Matching raw pixels are already the next RGB source, including on CPU fallback.
+    // Remember them before prefetch can overwrite the older capture allocation.
+    if (dma) |buffer| s.rememberDmaReference(buffer, width, height);
+    const cpu_source = if (dma == null) try h264Source(c, content) else null;
+    try c.prefetchCapture();
     const info = if (dma) |buffer| h.encodeDmaBuf(buffer.descriptor(), s.need_idr, &s.h264_out) catch |err| blk: {
         log.info("DMA-BUF encode unavailable ({t}); using CPU upload", .{err});
         s.dma_encode_off = true;
         const src = try h264Source(c, content);
         break :blk try h.encode(src, c.enc.shadowStride(), true, &s.h264_out);
-    } else try h.encode(try h264Source(c, content), c.enc.shadowStride(), s.need_idr, &s.h264_out);
-    if (dma) |buffer| if (!s.dma_encode_off) {
-        s.rememberDmaReference(buffer, width, height);
+    } else try h.encode(cpu_source.?, c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    if (dma != null and !s.dma_encode_off) {
         c.ch.stats.dma_frames += 1;
         if (!coversFrame(content, width, height)) c.ch.stats.dma_partial_frames += 1;
-    };
+    }
     if (dma != null and !s.dma_encode_off and !s.dma_encode_seen) {
         s.dma_encode_seen = true;
         log.info("H.264 directly imports the capture DMA-BUF when its source matches the selected updates", .{});
@@ -830,7 +834,7 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     const r = nominal(c);
     if (s.h264 == null) {
         // Init probes AVC444 on the device: error.Unsupported drops to AVC420.
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
+        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device, .wait_hook = .{ .ctx = c, .func = Conn.pumpEncodeInput } });
         s.need_idr = true;
         log.info("{s}: H.264 AVC444v2 encoder ready on {s} ({d}x{d}, QP per frame from its byte budget, {d} fps at most)", .{ c.peer, s.h264.?.node, width, height, r.fps });
     }
@@ -852,6 +856,7 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     s.h264_out.clearRetainingCapacity();
     s.aux_out.clearRetainingCapacity();
     const src = try h264Source(c, rects);
+    try c.prefetchCapture();
     const info = try h.encode444(src, c.enc.shadowStride(), s.need_idr, if (both_fit) .both else .luma, &s.h264_out, &s.aux_out);
     s.need_idr = false;
     // An IDR codes both views whatever was asked.

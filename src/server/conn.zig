@@ -38,6 +38,7 @@ const hypr = @import("../session/hypr.zig");
 const altdrag = @import("../session/altdrag.zig");
 const wl_capture = @import("../wl/capture.zig");
 const session_info = @import("session_info.zig");
+const input_pump_mod = @import("input_pump.zig");
 const remoteapp = @import("remoteapp.zig");
 pub const flight = @import("flight.zig");
 const c = @import("c");
@@ -188,6 +189,12 @@ pub const Conn = struct {
     anim_last_ms: i64 = 0,
     /// Recent traffic, dumped when the connection ends abnormally or on SIGUSR1.
     flight: flight.Recorder = .{},
+    input_pump: input_pump_mod.Pump = .{},
+    encode_input_enabled: bool = false,
+    dispatching_input: bool = false,
+    encode_input_error: ?Error = null,
+    capture_active: ?*const wl_capture.Frame = null,
+    capture_ahead: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, t: transport_mod.Transport, tls_ctx: *tls.Context, auth_cfg: *const AuthConfig, desktop_cfg: ?*const DesktopConfig, peer: []const u8) Conn {
         return .{ .gpa = gpa, .t = t, .tls_ctx = tls_ctx, .auth_cfg = auth_cfg, .desktop_cfg = desktop_cfg, .seat = if (desktop_cfg) |d| d.seat else null, .peer = peer, .enc = encoder_mod.Encoder.init(gpa) };
@@ -235,6 +242,7 @@ pub const Conn = struct {
         deadline.stop(&self.deadline); // before the socket is closed
         self.t.deinit();
         self.flight.deinit(self.gpa);
+        self.input_pump.deinit(self.gpa);
     }
 
     fn mayLinger(self: *const Conn) bool {
@@ -962,14 +970,17 @@ pub const Conn = struct {
         var events: [fastpath.max_events]fastpath.InputEvent = undefined;
         // From here on nothing waits on the network.
         try self.t.startNonBlocking();
+        self.encode_input_enabled = true;
+        defer self.encode_input_enabled = false;
         flow.start(self);
         self.pacing.logged_ms = nowMs();
         var pass_start = nowNs();
         while (true) {
+            if (self.encode_input_error) |err| return err;
             // Input first, including PDUs buffered inside TLS that poll() misses; a flood yields.
             var more_input = false;
             var budget: u32 = max_input_pdus;
-            while (try self.t.tryNext()) |pdu| {
+            while (try self.input_pump.next(&self.t)) |pdu| {
                 if (!try self.handlePdu(pdu, &events)) return;
                 budget -= 1;
                 if (budget == 0) {
@@ -1018,7 +1029,7 @@ pub const Conn = struct {
             if (self.flight.on()) timeout = if (timeout < 0) flight.live_poll_ms else @min(timeout, flight.live_poll_ms);
             if (self.pacing.retry_ms) |r| timeout = if (timeout < 0) @intCast(r) else @min(timeout, @as(c_int, @intCast(r)));
             timeout = flow.pollTimeout(self, timeout);
-            if (more_input) timeout = 0;
+            if (more_input or self.input_pump.pending() or self.encode_input_error != null) timeout = 0;
             if (d) |dd| if (dd.desk_activity) {
                 timeout = 0;
             };
@@ -1081,6 +1092,9 @@ pub const Conn = struct {
 
     /// Handles one client PDU; false when the client disconnected.
     fn handlePdu(self: *Conn, pdu: transport_mod.Pdu, events: []fastpath.InputEvent) Error!bool {
+        const was_dispatching = self.dispatching_input;
+        self.dispatching_input = true;
+        defer self.dispatching_input = was_dispatching;
         return self.dispatchPdu(pdu, events) catch |err| {
             self.flight.failed(if (pdu.kind == .fastpath) .fastpath else .mcs, pdu.data.len, err);
             return err;
@@ -1139,6 +1153,31 @@ pub const Conn = struct {
         }
     }
 
+    /// TLS and Wayland stay on their owning thread; graphics/control PDUs wait for the frame.
+    pub fn pumpEncodeInput(ctx: *anyopaque) void {
+        const self: *Conn = @ptrCast(@alignCast(ctx));
+        if (!self.encode_input_enabled or self.dispatching_input or self.encode_input_error != null) return;
+        self.input_pump.duringEncode(self.gpa, &self.t, self, handleEncodeInput) catch |err| {
+            self.encode_input_error = err;
+        };
+    }
+
+    fn handleEncodeInput(self: *Conn, pdu: transport_mod.Pdu) Error!void {
+        var events: [fastpath.max_events]fastpath.InputEvent = undefined;
+        const before = self.input_events;
+        _ = try self.handlePdu(pdu, &events);
+        self.ch.stats.encode_input_events += self.input_events - before;
+    }
+
+    /// Once the next H.264 RGB source is prepared, the older capture can be reused.
+    pub fn prefetchCapture(self: *Conn) Error!void {
+        const frame = self.capture_active orelse return;
+        if (self.capture_ahead) return;
+        try self.ch.surf.finishCapture(self.gpa, frame.dma);
+        try self.desktop.?.requestFrame();
+        self.capture_ahead = true;
+    }
+
     /// Test pattern: 3 s of motion, 2 s still; with `test_video`, a 30 fps video 15 s of every 20.
     fn pumpAnimation(self: *Conn) Error!void {
         if (!self.established or self.output_suppressed or self.reactivating) return;
@@ -1183,13 +1222,20 @@ pub const Conn = struct {
         if (surfaces.isMulti(self)) {
             if (!try surfaces.pump(self, d)) return;
         } else {
+            const pending = d.latestFrame() orelse return;
+            if (pending.replaced) self.ch.stats.capture_replaced += 1;
             if (!channels.canSendFrame(self)) {
-                if (d.frameReady()) {
-                    if (self.pacing.refused) self.pacing.held() else self.ch.stats.blocked += 1;
+                if (self.pacing.refused) self.pacing.held() else self.ch.stats.blocked += 1;
+                // Keep the last picture available if the screen stops changing while blocked.
+                // Only refresh a stale capture; normal frame pacing must not force a CPU snapshot.
+                if (pending.age_ns >= 2 * @as(u64, self.pacing.interval_ms) * std.time.ns_per_ms) {
+                    try self.ch.surf.finishCapture(self.gpa, pending.frame.dma);
+                    try d.requestFrame();
                 }
                 return;
             }
-            const f = d.takeFrame() orelse return;
+            const f = pending.frame;
+            if (f.dma) |buffer| try buffer.beginRead();
             if (f.width != d.width() or f.height != d.height()) {
                 // RDP-1 is briefly at another mode (Hyprland's rule after a config reload): skip unless it lasts.
                 const now = nowMs();
@@ -1198,6 +1244,7 @@ pub const Conn = struct {
                 if (now - since < self.odd_size_grace_ms) {
                     log.debug("{s}: skipping a {d}x{d} frame (the session is {d}x{d})", .{ self.peer, f.width, f.height, d.width(), d.height() });
                     try self.ch.surf.finishCapture(self.gpa, f.dma);
+                    d.consumeFrame();
                     return d.requestFrame();
                 }
                 if (!self.odd_size_taken) {
@@ -1208,13 +1255,17 @@ pub const Conn = struct {
                 self.odd_size_since_ms = null;
                 self.odd_size_taken = false;
             }
+            self.capture_active = f;
+            self.capture_ahead = false;
+            defer self.capture_active = null;
             channels.sendDesktopFrame(self, f) catch |err| switch (err) {
                 // A malformed frame is skipped; the client keeps its picture.
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame with stride {d} and {d} bytes", .{ self.peer, f.width, f.height, f.stride, f.data.len }),
                 else => return err,
             };
             try self.ch.surf.finishCapture(self.gpa, f.dma);
-            try d.requestFrame();
+            if (!self.capture_ahead) try d.requestFrame();
+            d.consumeFrame();
         }
         if (self.secret) |sec| {
             // The client now sees the lock screen (if any): unlock it.
@@ -1503,6 +1554,37 @@ pub const Conn = struct {
         try legacy.sendLossless(self);
     }
 };
+
+test "encode input hook handles keyboard batches, defers controls and preserves read errors" {
+    const t = std.testing;
+    var conn = Conn.init(t.allocator, transport_mod.Transport.init(-1), undefined, undefined, null, "input-test");
+    defer conn.enc.deinit();
+    defer conn.input_pump.deinit(t.allocator);
+    // Ctrl down, A down/up, Ctrl up; then a control PDU handled after encoding.
+    const packets = [_]u8{ 0x10, 10, 0, 0x1d, 0, 0x1e, 1, 0x1e, 1, 0x1d, 3, 0, 0, 7, 2, 0xf0, 0x80 };
+    @memcpy(conn.t.buf[0..packets.len], &packets);
+    conn.t.end = packets.len;
+    conn.t.nonblocking = true;
+    conn.encode_input_enabled = true;
+    conn.dispatching_input = true;
+    Conn.pumpEncodeInput(&conn);
+    try t.expectEqual(@as(usize, 0), conn.t.start);
+    conn.dispatching_input = false;
+    Conn.pumpEncodeInput(&conn);
+    try t.expectEqual(@as(u64, 4), conn.input_events);
+    try t.expectEqual(@as(u64, 4), conn.ch.stats.encode_input_events);
+    try t.expect(conn.encode_input_error == null);
+    try t.expect(conn.input_pump.pending());
+    @memset(&conn.t.buf, 0xff);
+    const control = (try conn.input_pump.next(&conn.t)).?;
+    try t.expectEqual(.tpkt, control.kind);
+    try t.expectEqualSlices(u8, &.{ 3, 0, 0, 7, 2, 0xf0, 0x80 }, control.data);
+    conn.t.start = 0;
+    conn.t.end = 1;
+    Conn.pumpEncodeInput(&conn);
+    try t.expect(conn.encode_input_error != null);
+    try t.expectEqual(@as(Error, error.BadFrame), conn.encode_input_error.?);
+}
 
 /// Most update data in one slow-path Update PDU (MS-RDPBCGR 2.2.9.1.1.3): PER length <= 0x3FFF.
 pub const max_slow_update = 0x3FFF - rdp.data_header_len;
