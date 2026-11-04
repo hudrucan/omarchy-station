@@ -1,11 +1,11 @@
 pkgname=omastation
 pkgver=0.0.1
-pkgrel=1
+pkgrel=2
 pkgdesc="RDP server for your Hyprland desktop"
 arch=(x86_64)
 license=(MIT)
 # gcc, pkgconf, binutils: the Hyprland plugin is rebuilt after every Hyprland update.
-depends=(binutils fuse3 gcc gsm hyprland jq libfdk-aac libpipewire libva libxkbcommon mesa openssl opus pam pkgconf vulkan-icd-loader)
+depends=(binutils fuse3 gcc gsm hyprland jq libfdk-aac libpipewire libva libxkbcommon mesa openssl opus pam pkgconf uwsm vulkan-icd-loader)
 # openh264: its headers; the library is loaded at run time when installed.
 makedepends=(git mise openh264 vulkan-headers)
 # Not stripped: a panic's trace needs the binary's DWARF.
@@ -20,6 +20,7 @@ source=("omastation::git+file://${startdir%/packaging/omastation}"
         omastation.ufw
         omastation-plugin.hook
         omastation-ufw.hook)
+source+=(omastation-login.service omastation-session@.service omastation-session-start omastation-login-recover 49-omastation-login.rules omastation-session-launch)
 sha256sums=('SKIP'
             '7cc10fb232c639d1dbe1ea53633ec9dd88895209e15b204b65b389d181cd1dc3'
             'd0ed0842b1fa53e25c02a5c38737b90dab54f75a6b8bb1fa0eacf73f2abbd151'
@@ -27,6 +28,13 @@ sha256sums=('SKIP'
             '66665335d168f38c17590dae7d382fc578fe19eb8b9d347e1f46cf0674cdcaf9'
             'dec64679a71d18bde0e212669121ca6844585f9856b5272194a0303579386d05'
             '2ddc6cda34d59199aca17a251dd8cb3e9991cdab2a1bcff6395c14d89a455900')
+sha256sums+=(
+            '088ec0678aef72c603f43bd801a2fa16450fd620705eff7f66dfbe3e1bfe6f85'
+            'cd30969d45346497266aa75cc8f92826083458ec5a20534de4b854714a2cda09'
+            '6474f8ebafcc8e97d979adc472bf2fb5adab25825031f92cba10a72f0073e997'
+            '5564c2c433fea2e45e3084ebb25210e9afde08270b044c35cb8680e5d01095a6'
+            '0c42f03374330c5b7d628490ad17cd258e2605e2a1470d3137e9b9e9a17e72d7'
+            'd5550cd4e4b2eba4d063bb252f8a0c225fec8314840defdeb907bdf8e9ca6ba6')
 
 # The version in build.zig.zon.
 pkgver() {
@@ -49,6 +57,13 @@ package() {
   install -Dm755 omastation/zig-out/bin/omastation "$pkgdir/usr/bin/omastation"
   install -Dm644 omastation.service "$pkgdir/usr/lib/systemd/user/omastation.service"
   install -Dm644 omastation-helper@.service "$pkgdir/usr/lib/systemd/system/omastation-helper@.service"
+  install -Dm644 omastation-login.service "$pkgdir/usr/lib/systemd/user/omastation-login.service"
+  install -Dm644 omastation-session@.service "$pkgdir/usr/lib/systemd/system/omastation-session@.service"
+  install -Dm755 omastation-session-launch "$pkgdir/usr/lib/omastation/omastation-session-launch"
+  install -Dm755 omastation-session-start "$pkgdir/usr/lib/omastation/omastation-session-start"
+  install -Dm755 omastation-login-recover "$pkgdir/usr/lib/omastation/omastation-login-recover"
+  # Optional authorization: install explicitly when enabling boot login.
+  install -Dm644 49-omastation-login.rules "$pkgdir/usr/share/omastation/49-omastation-login.rules"
   install -Dm755 omastation-recover "$pkgdir/usr/lib/omastation/omastation-recover"
   install -Dm755 omastation-plugin.so "$pkgdir/usr/lib/omastation/omastation-plugin.so"
   install -Dm755 omastation/plugin/build.sh "$pkgdir/usr/lib/omastation/omastation-plugin-build"

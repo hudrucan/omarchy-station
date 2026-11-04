@@ -1,6 +1,7 @@
 //! Desktop session integration: Hyprland outputs, console fencing, locking, clipboard, RemoteApp.
 
 pub const hypr = @import("hypr.zig");
+pub const login = @import("login.zig");
 pub const console = @import("console.zig");
 pub const fence = @import("fence.zig");
 pub const fence_daemon = @import("fence_daemon.zig");

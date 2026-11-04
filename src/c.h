@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <malloc.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>

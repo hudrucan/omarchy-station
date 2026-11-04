@@ -1,0 +1,39 @@
+#!/bin/bash
+set -euo pipefail
+
+# Called only after NLA + PAM, as the desktop owner. Never accept client arguments.
+user=$(id -un)
+[[ $user =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]] || { echo 'Unsupported Unix account name' >&2; exit 1; }
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:?Missing user runtime directory}
+
+instance() {
+  local instances count
+  instances=$(hyprctl -j instances) || return 1
+  # Hyprland 0.56.2 prints a lone closing bracket when there are no live instances.
+  if [[ $(tr -d '[:space:]' <<<"$instances") == ']' ]]; then instances='[]'; fi
+  count=$(jq -er 'if type == "array" then length else error("invalid instances") end' <<<"$instances") || return 2
+  if (( count > 1 )); then
+    echo 'Multiple Hyprland instances: refusing an ambiguous desktop' >&2
+    return 2
+  fi
+  (( count == 1 )) || return 1
+  # instances discards dead PIDs; the listener also verifies the IPC endpoint.
+  jq -er '.[0] | .instance, .wl_socket' <<<"$instances"
+}
+
+if instance; then exit 0; else status=$?; fi
+(( status == 1 )) || exit "$status"
+
+unit="omastation-session@${user}.service"
+systemctl --no-ask-password --no-block start "$unit"
+for (( attempt = 0; attempt < 150; attempt++ )); do
+  if instance; then exit 0; else status=$?; fi
+  (( status == 1 )) || exit "$status"
+  if systemctl --quiet is-failed "$unit"; then
+    echo "Desktop failed: journalctl -u $unit" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
+echo "Desktop startup timed out: journalctl -u $unit" >&2
+exit 1

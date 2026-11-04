@@ -58,6 +58,10 @@ const usage =
     \\  --insecure-allow-tls   accept TLS without NLA; NO authentication (development only)
     \\  --desktop              serve the real desktop: lock-screen takeover, physical
     \\                         monitors off while connected (without it: a test pattern)
+    \\  --login                boot listener: start the owner's desktop after NLA + PAM;
+    \\                         needs the optional session-start/systemd integration
+    \\  --session-starter FILE executable returning the Hyprland instance and Wayland
+    \\                         socket, one per line (default /usr/lib/omastation/omastation-session-start)
     \\  --lock-command CMD     locks the session on disconnect (default omarchy-system-lock)
     \\  --helper-socket PATH   root helper fencing the desk (default /run/omastation/helper.sock)
     \\  --require-fence        refuse sessions when the desk cannot be fenced
@@ -180,6 +184,8 @@ const Options = struct {
     hybrid_ex: bool = true,
     user: ?[:0]const u8 = null,
     desktop: bool = false,
+    login: bool = false,
+    session_starter: [:0]const u8 = "/usr/lib/omastation/omastation-session-start",
     lock_command: []const u8 = "omarchy-system-lock",
     helper_socket: [:0]const u8 = "/run/omastation/helper.sock",
     require_fence: bool = false,
@@ -241,6 +247,9 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
+    if (o.login and (o.no_pam or o.allow_tls)) return fail("--login requires NLA and PAM; insecure authentication options are not allowed");
+    if (o.login and c.getuid() == 0) return fail("--login must run as the desktop user, not root");
+
     o.features.io = init.io;
 
     const dir = try configDir(arena, init.environ_map);
@@ -295,6 +304,15 @@ pub fn main(init: std.process.Init) !void {
     defer tls_ctx.deinit();
 
     var seat: omastation.server.seat.Seat = .{};
+    var login: ?omastation.session.login.Login = null;
+    if (o.login) {
+        const pw = c.getpwuid(c.getuid()) orelse return fail("--login: cannot look up the current Unix account");
+        login = .{
+            .user = try arena.dupe(u8, std.mem.span(pw.*.pw_name)),
+            .runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse return fail("--login requires XDG_RUNTIME_DIR (start it as a systemd user service)"),
+            .starter = o.session_starter,
+        };
+    }
     var desktop_cfg: ?omastation.server.conn.DesktopConfig = null;
     if (o.desktop and o.test_capture != null) return fail("--test-capture is for development without --desktop");
     if (o.test_capture) |name| log.warn("DEVELOPMENT: serving output {s} of WAYLAND_DISPLAY read-only (--test-capture){s}", .{ name, if (o.gpu_capture) "" else " without GPU capture" });
@@ -307,7 +325,7 @@ pub fn main(init: std.process.Init) !void {
         } });
     };
     if (o.desktop) {
-        const ipc = omastation.session.hypr.Ipc.fromEnv(init.environ_map) catch
+        const ipc: omastation.session.hypr.Ipc = if (o.login) .{} else omastation.session.hypr.Ipc.fromEnv(init.environ_map) catch
             return fail("--desktop: not inside a Hyprland session (HYPRLAND_INSTANCE_SIGNATURE unset)");
         // The Option + drag bindings in force, for omastation-recover.
         const binds_state: ?[:0]const u8 = if (init.environ_map.get("XDG_RUNTIME_DIR")) |rt| blk: {
@@ -315,7 +333,7 @@ pub fn main(init: std.process.Init) !void {
             _ = c.mkdir(dir_z.ptr, 0o700);
             break :blk try std.mem.concatWithSentinel(arena, u8, &.{ rt, "/omastation/alt-drag-binds" }, 0);
         } else null;
-        if (binds_state) |p| omastation.session.altdrag.removeStale(&ipc, gpa, p);
+        if (!o.login) if (binds_state) |p| omastation.session.altdrag.removeStale(&ipc, gpa, p);
         // The console's restore plan while remote, for omastation-recover.
         const console_state: ?[:0]const u8 = if (init.environ_map.get("XDG_RUNTIME_DIR")) |rt|
             try std.mem.concatWithSentinel(arena, u8, &.{ rt, "/omastation/console-restore" }, 0)
@@ -323,17 +341,23 @@ pub fn main(init: std.process.Init) !void {
             null;
         // Loaded as a content-named copy in the runtime directory, so an upgraded plugin is new
         // code in a running Hyprland; omastation-recover unloads it when the service stops.
-        if (o.hyprland_plugin) |p| {
+        if (!o.login) if (o.hyprland_plugin) |p| {
             const staging: ?omastation.session.plugin.Staging = if (init.environ_map.get("XDG_RUNTIME_DIR")) |rt|
                 try omastation.session.plugin.Staging.inRuntimeDir(arena, rt)
             else
                 null;
             var text: [400]u8 = undefined;
             _ = omastation.session.plugin.activate(&ipc, gpa, p, staging, &text);
-        }
+        };
         // Bindings back on for keyboard names a previous run may have left without them.
-        omastation.session.textbinds.resetStale(&ipc, gpa);
+        if (!o.login) omastation.session.textbinds.resetStale(&ipc, gpa);
         desktop_cfg = .{
+            .login = if (login) |*l| l else null,
+            .login_plugin = o.hyprland_plugin,
+            .recovery_marker = if (o.login) if (init.environ_map.get("INVOCATION_ID")) |id|
+                try std.mem.concatWithSentinel(arena, u8, &.{ login.?.runtime_dir, "/omastation/login-recover-", id }, 0)
+            else
+                null else null,
             .ipc = ipc,
             .seat = &seat,
             .lock_command = o.lock_command,
@@ -472,6 +496,13 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
             o.allow_tls = true;
         } else if (std.mem.eql(u8, a, "--desktop")) {
             o.desktop = true;
+        } else if (std.mem.eql(u8, a, "--login")) {
+            o.desktop = true;
+            o.login = true;
+        } else if (std.mem.eql(u8, a, "--session-starter")) {
+            if (val.len == 0 or val[0] != '/') return fail("--session-starter requires an absolute executable path");
+            o.session_starter = val;
+            i += 1;
         } else if (std.mem.eql(u8, a, "--lock-command")) {
             o.lock_command = val;
             i += 1;
@@ -872,6 +903,7 @@ test "--h264-encoder picks who codes H.264, and --codecs all keeps it" {
 test "every option the usage text shows with a value consumes it" {
     // An option in the usage text without a sample here fails the test.
     const samples = [_]struct { []const u8, [:0]const u8 }{
+        .{ "--session-starter", "/starter" },
         .{ "--port", "3391" },              .{ "--cert", "/c" },                   .{ "--key", "/k" },
         .{ "--credentials", "/x" },         .{ "--pam-service", "login" },         .{ "--user", "u" },
         .{ "--lock-command", "true" },      .{ "--helper-socket", "/h" },          .{ "--reconnect-grace", "5" },

@@ -1,0 +1,11 @@
+[Unit]
+Description=omastation: on-demand RDP login for this user
+
+[Service]
+ExecStart=/usr/bin/omastation --login --port 3389
+ExecStopPost=/usr/lib/omastation/omastation-login-recover
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

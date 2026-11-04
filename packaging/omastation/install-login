@@ -1,0 +1,66 @@
+#!/bin/bash
+set -euo pipefail
+if (( EUID != 0 || $# != 2 )); then
+  echo "Usage: sudo $0 USER /absolute/path/omastation.pkg.tar.zst" >&2
+  exit 1
+fi
+user=$1
+package=$2
+[[ $user =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ && $user != root && $package == /* && -f $package ]] || exit 1
+uid=$(id -u "$user")
+home_dir=$(getent passwd "$user" | cut -d: -f6)
+as_user() { runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"; }
+[[ $(pacman -Qp "$package" | cut -d' ' -f1) == omastation ]] || { echo 'Expected an omastation package' >&2; exit 1; }
+
+# Do not race an independent test's automatic recovery.
+for name in omastation-login-cold-test omastation-login-cold-test-v2 omastation-login-cold-test-v3; do
+  if systemctl is-active --quiet "$name.service"; then
+    echo "Wait for $name.service to finish before rollout" >&2
+    exit 1
+  fi
+done
+
+# Upgrade the tested executable and integration through the package manager.
+# These three paths were installed manually by the prototype and are now package-owned.
+pacman -U --noconfirm \
+  --overwrite usr/lib/omastation/omastation-session-start \
+  --overwrite usr/lib/omastation/omastation-session-launch \
+  --overwrite usr/lib/omastation/omastation-login-recover "$package"
+
+install -d -m700 /var/lib/omastation/rollback
+if [[ -f /etc/sddm.conf.d/50-omastation-autologin.conf && ! -e /var/lib/omastation/rollback/sddm-autologin.conf ]]; then
+  install -m600 /etc/sddm.conf.d/50-omastation-autologin.conf /var/lib/omastation/rollback/sddm-autologin.conf
+fi
+install -Dm644 /dev/stdin /etc/sddm.conf.d/50-omastation-autologin.conf <<'CONF'
+[Autologin]
+User=
+Session=
+Relogin=false
+CONF
+install -Dm644 /usr/share/omastation/49-omastation-login.rules /etc/polkit-1/rules.d/49-omastation-login.rules
+loginctl enable-linger "$user"
+
+# Retire only the known prototype overrides; packaged units now supply these paths.
+rm -f /etc/sddm.conf.d/99-omastation-login-test.conf \
+  /etc/systemd/user/omastation-login.service \
+  /etc/systemd/user/omastation-login.service.d/prototype.conf \
+  /etc/systemd/system/omastation-session@.service
+as_user rm -f "$home_dir/.config/systemd/user/omastation-login.service.d/zz-port.conf"
+rmdir /etc/systemd/user/omastation-login.service.d 2>/dev/null || true
+as_user rmdir "$home_dir/.config/systemd/user/omastation-login.service.d" 2>/dev/null || true
+systemctl daemon-reload
+as_user systemctl --user daemon-reload
+as_user systemctl --user disable --now omastation
+as_user systemctl --user reenable omastation-login
+as_user systemctl --user restart omastation-login
+as_user systemctl --user is-active --quiet omastation-login
+
+# Nothing below can interrupt a desktop; remove completed test infrastructure.
+for name in omastation-login-cold-test omastation-login-cold-test-v2 omastation-login-cold-test-v3; do
+  systemctl stop "$name.timer" 2>/dev/null || true
+  systemctl reset-failed "$name.service" 2>/dev/null || true
+done
+rm -f /usr/local/lib/omastation-login/omastation
+rmdir /usr/local/lib/omastation-login 2>/dev/null || true
+rm -rf /run/omastation-login-cold-test
+printf '%s\n' 'Production omastation-login enabled on 3389; SDDM autologin disabled.'

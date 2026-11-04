@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+# Only a listener that entered remote mode owns shared desktop recovery state.
+[[ -n ${INVOCATION_ID:-} && -n ${XDG_RUNTIME_DIR:-} ]] || exit 0
+marker=$XDG_RUNTIME_DIR/omastation/login-recover-$INVOCATION_ID
+[[ -f $marker ]] || exit 0
+# Resolve only an existing session: recovery must never log the user in.
+instances=$(hyprctl -j instances)
+[[ $(jq 'length' <<<"$instances") == 1 ]] || exit 0
+HYPRLAND_INSTANCE_SIGNATURE=$(jq -er '.[0].instance' <<<"$instances")
+WAYLAND_DISPLAY=$(jq -er '.[0].wl_socket' <<<"$instances")
+export HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY
+rm -f -- "$marker"
+exec /usr/lib/omastation/omastation-recover

@@ -43,6 +43,10 @@ pub const default_locker_status_command = "LANG=C.UTF-8 OMARCHY_PATH=${OMARCHY_P
 pub const CursorMode = cursor_mod.Mode;
 
 pub const Options = struct {
+    /// Explicit socket for a session created after the listener started.
+    display: ?[]const u8 = null,
+    /// Per-service-invocation ownership: stopping an idle test listener cannot recover another server.
+    recovery_marker: ?[:0]const u8 = null,
     width: u32,
     height: u32,
     scale_percent: u32 = 100,
@@ -250,13 +254,12 @@ pub const Desktop = struct {
             .text = text,
             .cursor = cursor_mod.Tracker.init(gpa, opts.cursor),
         };
+        errdefer d.arena.deinit();
+        errdefer d.text.deinit(gpa);
+        errdefer d.cursor.deinit();
+        if (opts.display) |display| d.opts.display = try d.arena.allocator().dupe(u8, display);
         if (opts.gpu_capture) {
-            const sh = gpucap.Shared.create(gpa) catch |e| {
-                d.text.deinit(gpa);
-                d.cursor.deinit();
-                d.arena.deinit();
-                return e;
-            };
+            const sh = try gpucap.Shared.create(gpa);
             d.gpu_shared = sh;
             for (&d.gpu_out) |*o| o.* = gpucap.Output.init(sh);
         }
@@ -383,6 +386,14 @@ pub const Desktop = struct {
         }
         d.entered = true; // from here on, leave() locks before restoring
         errdefer d.leave();
+        if (d.opts.recovery_marker) |path| {
+            const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
+            if (fd < 0) {
+                log.err("cannot record this listener's crash recovery ownership", .{});
+                return error.EnterFailed;
+            }
+            _ = c.close(fd);
+        }
         d.writeRestoreFile();
         d.installScaleWatch();
         if (d.multi()) {
@@ -399,7 +410,7 @@ pub const Desktop = struct {
     }
 
     fn connectWayland(d: *Desktop) Error!void {
-        const client = try wl.Client.connect(d.gpa, .{});
+        const client = try wl.Client.connect(d.gpa, .{ .display = d.opts.display });
         d.client = client;
         // The new outputs' globals arrive asynchronously.
         var waited: i32 = 0;
@@ -478,7 +489,9 @@ pub const Desktop = struct {
         d.keys = .{};
         d.bells = 0; // rung while nobody listened
         d.utf16 = .{};
+        const display = d.opts.display;
         d.opts = opts;
+        d.opts.display = display;
         const several = if (opts.layout) |l| l.count > 1 else false;
         d.client_layout = if (several) opts.layout.? else singleLayout(opts.width, opts.height, opts.scale_percent);
         // A scale set in the session stays for a client asking for the same one.
@@ -563,6 +576,9 @@ pub const Desktop = struct {
     /// Locks, restores monitors and workspaces, removes the RDP outputs and releases the desk. Without an
     /// observed lock, or while a password may still be checked, the physical monitors stay off.
     pub fn leave(d: *Desktop) void {
+        defer if (!d.entered) {
+            if (d.opts.recovery_marker) |path| _ = c.unlink(path.ptr);
+        };
         d.stopQueries();
         d.removeTwins();
         d.alt_drag = false;
