@@ -5,25 +5,42 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    name: zig build test (Arch Linux)
+    name: Build and check (Arch Linux)
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - name: Install zig and the libraries the server links
-        run: pacman -Syu --noconfirm --needed git zig pkgconf openssl pam libva mesa vulkan-headers vulkan-icd-loader libxkbcommon opus libfdk-aac gsm fuse3 libpipewire openh264
+      - name: Install build and test dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          git mise python hyprland jq
+          pkgconf openssl pam libva mesa vulkan-headers vulkan-icd-loader
+          libxkbcommon opus libfdk-aac gsm fuse3 libpipewire openh264
 
       - uses: actions/checkout@v4
 
-      - name: Formatting
-        run: zig fmt --check build.zig src
+      - name: Restore toolchain and build caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/mise/installs/zig
+            ~/.cache/zig
+            ~/.cache/omastation/build
+          key: ${{ runner.os }}-omastation-${{ hashFiles('mise.toml') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-omastation-${{ hashFiles('mise.toml') }}-
 
-      - name: Build (ReleaseSafe, as packaged)
-        run: zig build -Doptimize=ReleaseSafe
+      - name: Set up the pinned toolchain
+        run: |
+          mise trust
+          mise install
 
-      - name: Unit tests
-        run: zig build test --summary all
+      - name: Build, check formatting and run unit/integration tests
+        run: make check JOBS=2
 
       - name: Benchmark builds and runs
-        run: zig build bench -Doptimize=ReleaseSafe -- --size 640x360 --reps 1 --only kernels,lossless
+        run: make bench JOBS=2
