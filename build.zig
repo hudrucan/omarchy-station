@@ -73,6 +73,41 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     const exe_tests = b.addTest(.{ .name = "main", .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+
+    // This plugin targets the installed compositor and must see its current headers/build ID.
+    const plugin = b.addSystemCommand(&.{"sh"});
+    plugin.addFileArg(b.path("plugin/build.sh"));
+    plugin.addDirectoryArg(b.path("plugin"));
+    const plugin_out = plugin.addOutputFileArg("omastation-plugin.so");
+    plugin.has_side_effects = true;
+    const install_plugin = b.addInstallLibFile(plugin_out, "omastation-plugin.so");
+    b.step("plugin", "Build the plugin for the installed Hyprland").dependOn(&install_plugin.step);
+
+    const check = b.step("check", "Build server/plugin, check formatting and run unit/integration tests");
+    check.dependOn(b.getInstallStep());
+    check.dependOn(&install_plugin.step);
+    check.dependOn(test_step);
+    const fmt = b.addFmt(.{ .paths = &.{ b.path("build.zig"), b.path("build.zig.zon"), b.path("src") }, .check = true });
+    check.dependOn(&fmt.step);
+    const integration = b.addSystemCommand(&.{"python3"});
+    integration.addFileArg(b.path("tests/login_start.py"));
+    check.dependOn(&integration.step);
+    for ([_][]const u8{
+        "install-omarchy",
+        "plugin/build.sh",
+        "packaging/omastation/PKGBUILD",
+        "packaging/hyprland/PKGBUILD",
+        "packaging/omastation/install-login",
+        "packaging/omastation/omastation-session-start",
+        "packaging/omastation/omastation-session-launch",
+        "packaging/omastation/omastation-login-recover",
+        "packaging/omastation/omastation-recover",
+    }) |path| {
+        // bash -n accepts one script; use a separate step for each file.
+        const syntax = b.addSystemCommand(&.{ "bash", "-n" });
+        syntax.addFileArg(b.path(path));
+        check.dependOn(&syntax.step);
+    }
 }
 
 const wl_protocol_xmls = [_][]const u8{

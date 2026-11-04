@@ -1,17 +1,19 @@
 pkgname=omastation
 pkgver=0.0.1
-pkgrel=2
+pkgrel=3
 pkgdesc="RDP server for your Hyprland desktop"
+url="https://github.com/hudrucan/omastation"
 arch=(x86_64)
 license=(MIT)
 # gcc, pkgconf, binutils: the Hyprland plugin is rebuilt after every Hyprland update.
 depends=(binutils fuse3 gcc gsm hyprland jq libfdk-aac libpipewire libva libxkbcommon openssl opus pam pkgconf uwsm)
-makedepends=(git mise)
+makedepends=(make)
 # Not stripped: a panic's trace needs the binary's DWARF.
 options=(!debug !strip)
 optdepends=('pipewire: audio to the client, the client microphone as a source (with wireplumber)'
             'ufw: firewall profile for port 3389 (TCP and UDP)')
-source=("omastation::git+file://${startdir%/packaging/omastation}"
+# `make package` supplies a snapshot of the current working tree in SRCDEST.
+source=(omastation.tar
         omastation.service
         omastation-helper@.service
         omastation-recover
@@ -42,17 +44,12 @@ pkgver() {
 
 build() {
   cd omastation
-  # Zig 0.17 (Arch's zig is older): installed by mise into the build directory.
-  export MISE_DATA_DIR="$srcdir/mise" MISE_CACHE_DIR="$srcdir/mise-cache"
-  (cd / && mise install -q zig@0.17.0)
-  local zig
-  zig=$(cd / && mise where zig@0.17.0)/zig
-  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-global-cache" "$zig" build -Doptimize=ReleaseSafe
-  sh plugin/build.sh plugin "$srcdir/omastation-plugin.so"
+  # The caller supplies the pinned Zig on PATH; never install a compiler during build().
+  make ZIG="$(command -v zig)" BUILD_DIR="$srcdir/build" build plugin
 }
 
 package() {
-  install -Dm755 omastation/zig-out/bin/omastation "$pkgdir/usr/bin/omastation"
+  install -Dm755 build/out/bin/omastation "$pkgdir/usr/bin/omastation"
   install -Dm644 omastation.service "$pkgdir/usr/lib/systemd/user/omastation.service"
   install -Dm644 omastation-helper@.service "$pkgdir/usr/lib/systemd/system/omastation-helper@.service"
   install -Dm644 omastation-login.service "$pkgdir/usr/lib/systemd/user/omastation-login.service"
@@ -63,7 +60,7 @@ package() {
   # Optional authorization: install explicitly when enabling boot login.
   install -Dm644 49-omastation-login.rules "$pkgdir/usr/share/omastation/49-omastation-login.rules"
   install -Dm755 omastation-recover "$pkgdir/usr/lib/omastation/omastation-recover"
-  install -Dm755 omastation-plugin.so "$pkgdir/usr/lib/omastation/omastation-plugin.so"
+  install -Dm755 build/out/lib/omastation-plugin.so "$pkgdir/usr/lib/omastation/omastation-plugin.so"
   install -Dm755 omastation/plugin/build.sh "$pkgdir/usr/lib/omastation/omastation-plugin-build"
   install -Dm644 omastation/plugin/omastation-plugin.cpp "$pkgdir/usr/share/omastation/plugin/omastation-plugin.cpp"
   install -Dm644 omastation-plugin.hook "$pkgdir/usr/share/libalpm/hooks/omastation-plugin.hook"

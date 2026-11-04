@@ -78,14 +78,15 @@ sha256sums=('03ad3f5ef152ff44116ffd56fcf808486211ecabf4f0ba567108ee746ba5cd2e'
 prepare() {
 	ln -sf hyprland-source "$_archive"
 	cd "$_archive"
-	sed -i -e '/^release:/{n;s/-D/-DCMAKE_SKIP_RPATH=ON -D/}' Makefile
 	sed -i -e '/find_package.glaze/s/7...<8 //' {.,hyprpm,start}/CMakeLists.txt
 	patch -Np1 -i "$srcdir/0001-screenshare-capture-cursor-images.patch"
 }
 
 build() {
 	cd "$_archive"
-	make release PREFIX=/usr
+	cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_SKIP_RPATH=ON
+	cmake --build build --parallel "${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 }
 
 package() {

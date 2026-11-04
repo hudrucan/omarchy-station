@@ -4,5 +4,5 @@
     .fingerprint = 0x705ed69245303425,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "src" },
+    .paths = .{ "build.zig", "build.zig.zon", "mise.toml", "Makefile", "install-omarchy", "src", "protocols", "plugin", "packaging", "tests", "docs", "README.md", "LICENSE" },
 }

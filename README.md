@@ -1,94 +1,134 @@
-# omastation
+# Omastation
 
-**Your [Omarchy](https://omarchy.org/) desktop, from anywhere. It feels like Windows RDP.**
+Your [Omarchy](https://omarchy.org/) desktop over RDP. Reconnect to your existing
+windows and workspaces, with screens and scaling fitted to the remote client.
 
-Open Remote Desktop on your laptop, type your password, and you're at your desk: the same
-windows and workspaces, fitted to the screen in front of you, with a pointer that never lags.
-Disconnect and the desk locks before its screens come back on. Sit down at it later and sign
-in: everything is where you left it.
+[Install](#install) · [Use](#use) · [Configure](#configure) · [Development](#development)
 
-No permission prompts, no second desktop, no unlocked screen glowing at your desk.
+- **Your existing session.** Workspaces move to remote outputs and return when you disconnect.
+- **A private desk.** Remote takeover turns off physical monitors and fences local input;
+  disconnect locks the desktop before restoring it.
+- **Adaptive graphics.** Changed regions are sent to the client, with H.264 hardware encoding
+  where available and lossless refinement when the screen settles.
+- **Desktop integration.** Audio, microphone, clipboard and files, drive redirection,
+  RemoteApp, touch and pen, subject to client capabilities.
+- **Optional login before the desktop starts.** Authenticate first, then start or reuse your
+  desktop through the separate [login integration](docs/login.md).
 
-- **Your real session**, not a copy. Workspaces move to the client's screens and come back
-  exactly as they were; the desk goes dark, its keyboard and mouse fenced, its speakers muted.
-- **A pointer that never lags.** Your client draws it, as with Windows.
-- **Fits any screen.** Size, DPI and monitors follow your client live, as you resize the window
-  or drag it to another display.
-- **Built for Omarchy.** It logs you into Omarchy's own lock screen and locks it when you leave,
-  even after a crash. Sign in at the desk and the desk takes over.
-- **Your keyboard, your bindings.** The client's layout is picked for you, Hyprland bindings
-  and key repeat just work, and a Mac gets Option + drag for SUPER + drag.
-- **Survives bad Wi-Fi.** Drop out and reconnect within 2 minutes: same session, desk still
-  dark. Quality follows your bandwidth, and a still screen sharpens to pixel-perfect.
-- **Windows clients just work**, because omastation speaks RDP the way Windows does.
-- **And the rest:** sound and microphone, copy and paste with files, your client's drives in
-  `~/RDP Drives`, RemoteApp, touch and pen.
+## Install
 
-## Get started
+On Omarchy:
 
 ```sh
-git clone https://github.com/realazizk/omastation
-cd omastation/packaging/omastation && makepkg -si
-cd ../hyprland && makepkg -si                            # the smooth pointer; log out and in after
-omastation passwd                                        # your Linux login password
-sudo systemctl enable --now omastation-helper@$(id -u)   # fences the desk's input
-systemctl --user enable --now omastation                 # the server
-sudo ufw allow omastation                                # port 3389, TCP and UDP
+git clone https://github.com/hudrucan/omastation.git
+cd omastation
+./install-omarchy
 ```
 
-Then connect from any RDP client with your Linux user name and password.
+The installer installs dependencies through Omarchy, sets up the pinned Zig
+toolchain with mise, and builds and installs an Arch package through pacman.
+Builds stay under `~/.cache/omastation`; packages stay under
+`~/.local/share/omastation/packages`. The checkout contains source only.
 
-`packaging/hyprland` is Arch's Hyprland plus omastation's cursor fix. Without it the pointer is
-painted into the picture; Arch's next Hyprland update replaces it.
+Omastation installs to `/usr` because its helper, systemd units and plugin rebuild
+hook use system paths. Installing the package does not enable remote access;
+follow the steps below.
 
-## Login before the desktop starts
+<details>
+<summary><strong>Optional Hyprland cursor patch</strong></summary>
 
-`omastation --login` listens on port **3389** without a running desktop. After
-NLA and PAM authenticate the listener's Unix owner, it reuses that user's sole
-live Hyprland instance or starts `omastation-session@USER.service`. systemd
-opens a PAM session on VT 8; the launcher activates that session before UWSM
-starts Hyprland so it can acquire the GPU. Logout ends the desktop while the
-listener keeps running. Disconnect keeps the desktop and locks it as usual.
-
-This mode serves one Unix user per listener. It needs an accessible home and
-credential store before login, UWSM, polkit, and a free VT 8. Multiple live
-Hyprland instances are refused. NLA and PAM are mandatory. Disk/home encryption
-must already be unlocked. Startup is limited to 40 seconds. Physical display
-isolation during startup has not been verified on a machine with a monitor.
-
-Install the built Arch package, then enable boot login as the desktop user:
+The included Hyprland patch fixes cursor-image capture so the RDP client can draw
+the pointer separately from desktop frames. Without the fix, Omastation can fall
+back to painting the cursor into the picture.
 
 ```sh
-sudo packaging/omastation/install-login "$(id -un)" /absolute/path/omastation-0.0.1-2-x86_64.pkg.tar.zst
+make hyprland-package MAKEPKG_FLAGS=--install
 ```
 
-The installer enables lingering, disables SDDM autologin, installs the narrow
-polkit rule, disables the session-bound `omastation` service, and enables
-`omastation-login`. Existing RDP connections briefly disconnect during rollout.
-The original autologin configuration is saved in
-`/var/lib/omastation/rollback/sddm-autologin.conf`. It does not reboot the host.
-Keep SSH available for recovery. Use the existing firewall profile for TCP/UDP
-3389; an SSH tunnel is not required when that port is reachable.
+This builds and replaces the installed Hyprland with the version in
+`packaging/hyprland/PKGBUILD`. Log out and back in afterwards. A later Arch
+Hyprland upgrade can replace the patch; this build is independent of normal
+Omastation development.
 
-The polkit rule permits users to start only their own fixed desktop unit; RDP
-connections still pass NLA and PAM. The listener and desktop run as the user.
-The system unit and authorization rule must remain root-owned.
+</details>
 
-`--session-starter /absolute/executable` overrides startup. Its stdout contract
-is two lines: Hyprland instance signature and Wayland socket basename. It runs
-after authentication, as the listener owner, without passwords/client arguments.
-Diagnostics go to stderr/the journal.
+## Use
+
+From an existing Hyprland session:
 
 ```sh
-journalctl --user -u omastation-login
-journalctl -u "omastation-session@$(id -un).service"
+omastation passwd
+sudo systemctl enable --now "omastation-helper@$(id -u)"
+systemctl --user enable --now omastation
 ```
 
-To return to session-bound remote access, disable `omastation-login`, restore
-SDDM autologin from the saved configuration if desired, and enable `omastation`
-in a running desktop. Do not run both listeners on the same port. Do not stop
-the system session unit while its desktop contains work you need to keep.
+Use your Linux login password when saving the RDP credentials. Connect an RDP
+client to this machine on port **3389**, using your Linux user name and password.
+If you use UFW, the package provides a profile:
 
-## License
+```sh
+sudo ufw allow omastation
+```
 
-MIT, see [LICENSE](LICENSE).
+The session-bound service needs a running Hyprland desktop. For remote login
+before the desktop starts, use [on-demand login](docs/login.md); it replaces the
+session-bound listener on the same port.
+
+## Configure
+
+`omastation --help` lists server options. The packaged service runs
+`omastation --desktop`; the optional login service runs `omastation --login`.
+Client monitor size, scale and layout are negotiated on connection.
+
+The native plugin is compiled against the installed Hyprland headers and build
+ID. Its package hook rebuilds it after Hyprland upgrades. Log in again after an
+upgrade so the running compositor matches the installed files.
+
+<details>
+<summary><strong>Update and troubleshoot</strong></summary>
+
+From your checkout:
+
+```sh
+git pull --ff-only
+./install-omarchy
+```
+
+Inspect the active service:
+
+```sh
+journalctl --user -u omastation
+journalctl -u "omastation-helper@$(id -u)"
+```
+
+For the optional boot listener, use `journalctl --user -u omastation-login`.
+Rebuilding and installing a package does not rebuild the patched compositor.
+
+</details>
+
+## Development
+
+The server is written in Zig, with a C++ Hyprland plugin. Build/check commands
+live at the repository root and generated files stay outside the source checkout.
+
+```sh
+mise trust
+mise install
+make build
+make check
+```
+
+`make build` builds the server. `make check` also compiles the plugin for the
+installed Hyprland, checks Zig formatting and shell syntax, and runs Zig unit
+tests and the desktop-start integration tests without changing live services.
+Use `make plugin`, `make bench`, `make package` or `make install` for those tasks.
+
+See [building and packaging](docs/build.md) for dependencies, cache locations,
+parallelism and package snapshots. `make package` includes current source changes;
+you do not need to commit them first.
+
+This is a fork of [realazizk/omastation](https://github.com/realazizk/omastation).
+Original MIT copyright is retained. Found a bug? [Open an issue](https://github.com/hudrucan/omastation/issues)
+with your Omarchy, Hyprland and RDP client versions and steps to reproduce.
+
+[MIT license](LICENSE)

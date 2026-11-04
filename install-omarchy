@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$repo_dir"
+
+if ! command -v omarchy >/dev/null; then
+  printf 'install-omarchy: this installer requires Omarchy\n' >&2
+  exit 1
+fi
+
+omarchy pkg add \
+  base-devel mise python hyprland uwsm jq openssl pam libva \
+  libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+
+mise trust "$repo_dir/mise.toml"
+mise install
+make install

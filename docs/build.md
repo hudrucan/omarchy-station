@@ -1,0 +1,98 @@
+# Building and packaging
+
+The Makefile is the common entry point for local development, the installer and
+CI. `build.zig` defines server compilation, Wayland protocol generation and Zig
+tests. `plugin/build.sh` defines native plugin compilation and is also installed
+for the Hyprland package hook. `PKGBUILD` calls these build steps and stages the
+system files; it never downloads or installs a compiler.
+
+## Dependencies
+
+On Omarchy, `./install-omarchy` installs dependencies and the built package. To
+prepare a development machine without installing Omastation:
+
+```sh
+omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+mise trust
+mise install
+```
+
+On Arch without Omarchy, install the same dependency list through pacman.
+`mise.toml` pins Zig; `build.zig.zon` declares the minimum supported version and
+the server version. The compiler lives in mise's shared installation directory,
+not in a package build tree. There is no compiler download during `make build`.
+
+## Commands
+
+| Command | Work performed |
+| --- | --- |
+| `make build` | Build the server in ReleaseSafe mode |
+| `make plugin` | Build the native plugin against installed Hyprland |
+| `make check` | Build server/plugin, check formatting and shell syntax, run Zig and Python tests |
+| `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
+| `make package` | Snapshot the working tree and build an Arch package |
+| `make install` | Build the package and install it through makepkg/pacman |
+| `make hyprland-package` | Build the separate patched compositor package |
+| `make clean` | Remove development build outputs and the local Zig cache |
+
+The native plugin is rebuilt when its target is requested so changes to installed
+Hyprland headers and its build ID cannot leave a stale plugin. Normal server
+builds do not compile the plugin or Hyprland itself.
+
+The checks use fake desktop-start commands and a fake compositor where applicable.
+They do not enable units, change login settings or establish a real remote desktop
+session. A successful check is not a live client compatibility or display-isolation
+test.
+
+For fewer parallel jobs or another build location:
+
+```sh
+make check JOBS=2
+make build BUILD_DIR=/path/to/build
+make build ZIG=/path/to/zig OPTIMIZE=Debug
+```
+
+## Files outside the checkout
+
+| Data | Default location |
+| --- | --- |
+| Development build cache | `~/.cache/omastation/build/zig-cache` |
+| Development executable | `~/.cache/omastation/build/out/bin/omastation` |
+| Development plugin | `~/.cache/omastation/build/out/lib/omastation-plugin.so` |
+| Shared Zig cache | `~/.cache/zig` |
+| Package source snapshots/downloads | `~/.cache/omastation/sources` |
+| makepkg source, build and staging directories | `~/.cache/omastation/makepkg` |
+| Package log destination (with makepkg `--log`) | `~/.cache/omastation/logs` |
+| Built packages | `~/.local/share/omastation/packages` |
+
+`XDG_CACHE_HOME` and `XDG_DATA_HOME` replace the corresponding default roots.
+`BUILD_DIR`, `ZIG_GLOBAL_CACHE_DIR`, `BUILDDIR`, `SRCDEST`, `PKGDEST` and `LOGDEST`
+can be overridden. Keep build directories in a stable location to retain
+incremental build state. `make clean` leaves the shared toolchain/global cache,
+makepkg work trees, source archives and finished packages intact.
+
+## Packaging the working tree
+
+`make package` creates `omastation.tar` from the current checkout, excluding Git
+metadata and ignored files, then gives the snapshot to makepkg. This includes
+uncommitted and new source files.
+
+The archive is extracted in the external makepkg directory. Its server and plugin
+are built through the same Makefile, using the pinned compiler supplied on PATH.
+The output keeps DWARF information for crash backtraces. Package metadata and
+system integration live under `packaging/omastation/`.
+
+Package names use the version from `build.zig.zon` and `pkgrel` from `PKGBUILD`.
+Repeated development builds replace the same package filename; retain a copy
+elsewhere if you need that exact build for rollback. Do not run two package builds
+against the same source/build directories concurrently.
+
+The optional patched Hyprland build has its own makepkg tree. It honours `JOBS`
+through `CMAKE_BUILD_PARALLEL_LEVEL` and is requested explicitly:
+
+```sh
+make hyprland-package JOBS=2
+```
+
+Add `MAKEPKG_FLAGS=--install` to install it, or `MAKEPKG_FLAGS=--log` to retain
+build logs. Neither normal server builds nor package updates rebuild Hyprland.
