@@ -89,6 +89,19 @@ pub fn build(b: *std.Build) void {
     capbench_step.dependOn(&b.addInstallArtifact(capbench, .{}).step);
     capbench_step.dependOn(&run_capbench.step);
 
+    const window_fit_test = b.addExecutable(.{
+        .name = "omastation-window-fit-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/window_fit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "omastation", .module = lib_mod }},
+        }),
+    });
+    const run_window_fit_test = b.addRunArtifact(window_fit_test);
+    b.step("test-window-fit", "Check floating-window recovery on an isolated test desktop").dependOn(&run_window_fit_test.step);
+
     const test_filters = b.option([]const []const u8, "test-filter", "unit tests: only those whose name contains this") orelse &.{};
     const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");

@@ -85,6 +85,19 @@ uses the separate image clipboard formats.
 `omastation --desktop`; the optional login service runs `omastation --login`.
 Client monitor size, scale and layout are negotiated on connection.
 
+After a display change, floating windows on the remote outputs are moved into
+the work area and shrunk only where they exceed it, including windows on inactive
+workspaces. Applications that require a larger minimum size keep their top-left
+corner reachable. Tiled and fullscreen windows follow Hyprland's layout. Growing
+the display does not restore earlier window sizes.
+
+Desktop capture uses DMA-BUF and Vulkan when supported, with shared-memory
+fallback. Changes are detected on the GPU, and eligible H.264 updates write their
+selected blocks directly into the encoder's NV12 surfaces. Other updates read
+back the pixels they need. Use `--no-gpu-capture` to force shared-memory capture.
+H.264 uses VA-API when available, with optional OpenH264 software fallback;
+`--h264-encoder auto|vaapi|software` selects the backend.
+
 The native plugin is compiled against the installed Hyprland headers and build
 ID. Its package hook rebuilds it after Hyprland upgrades. Log in again after an
 upgrade so the running compositor matches the installed files.

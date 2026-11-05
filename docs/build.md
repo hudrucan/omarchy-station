@@ -30,6 +30,8 @@ not in a package build tree. There is no compiler download during `make build`.
 | `make plugin` | Build the native plugin against installed Hyprland |
 | `make check` | Build server/plugin, check formatting and shell syntax, run Zig and Python tests |
 | `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
+| `make test-capture` | Run the upstream DMA-BUF capture benchmark on an isolated `BASE` output |
+| `make test-window-fit` | Exercise floating-window recovery in a temporary nested compositor |
 | `make package` | Snapshot the working tree and build an Arch package |
 | `make install` | Build the package and install it through makepkg/pacman |
 | `make hyprland-package` | Build the separate patched compositor package |
@@ -47,6 +49,19 @@ test.
 The graphics log counts input events serviced during bounded VA-API waits.
 Graphics/control PDUs remain ordered with input. GPU capture and masked NV12
 conversion use the upstream Vulkan pipeline; `--no-gpu-capture` selects SHM.
+
+`make test-capture` runs the upstream `capbench` against a separate compositor's
+output named `BASE`. Set its `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`; the command
+uses the same external build directory as `make build`. It is separate from
+`make check` and must not be pointed at a personal desktop.
+
+`make test-window-fit` starts a separate Hyprland compositor with synthetic
+Quickshell windows and cleans it up afterwards. It checks a 2K-to-portrait resize,
+an inactive workspace, application minimum sizes, and preservation of windows
+that already fit or belong to another monitor. It also checks that growing the
+display does not enlarge windows. It needs Hyprland, Quickshell and one running
+Hyprland instance for the nested renderer; it does not resize the live desktop.
+
 
 For fewer parallel jobs or another build location:
 

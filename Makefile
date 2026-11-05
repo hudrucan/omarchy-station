@@ -21,7 +21,7 @@ ZIG_BUILD_FLAGS = --cache-dir "$(ZIG_LOCAL_CACHE_DIR)" \
 PACKAGE_ENV = BUILDDIR="$(BUILDDIR)" SRCDEST="$(SRCDEST)" \
 	PKGDEST="$(PKGDEST)" LOGDEST="$(LOGDEST)"
 
-.PHONY: all build plugin check bench package install hyprland-package clean
+.PHONY: all build plugin check bench test-capture test-window-fit package install hyprland-package clean
 
 all: build
 
@@ -36,6 +36,12 @@ check:
 
 bench:
 	$(ZIG) build bench $(ZIG_BUILD_FLAGS) -- $(BENCH_ARGS)
+
+test-capture:
+	$(ZIG) build capbench $(ZIG_BUILD_FLAGS) -- --output BASE --mode dmabuf
+
+test-window-fit:
+	ZIG="$(ZIG)" OPTIMIZE="$(OPTIMIZE)" JOBS="$(JOBS)" python3 tests/window_fit.py
 
 # Snapshot the working tree, including uncommitted source, without build artifacts.
 package:

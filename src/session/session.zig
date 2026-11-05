@@ -10,6 +10,7 @@ pub const helper_proto = @import("helper_proto.zig");
 pub const uinput = @import("uinput.zig");
 pub const touch = @import("touch.zig");
 pub const desktop = @import("desktop.zig");
+pub const window_fit = @import("window_fit.zig");
 pub const cursor = @import("cursor.zig");
 pub const altdrag = @import("altdrag.zig");
 pub const plugin = @import("plugin.zig");

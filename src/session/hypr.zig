@@ -190,6 +190,8 @@ pub const MonitorState = struct {
     /// Special workspace shown over the active one (id 0: none).
     special_workspace: []const u8 = "",
     special_workspace_id: i64 = 0,
+    /// Exclusive layer-shell zones: left, top, right, bottom (logical pixels).
+    reserved: [4]i32 = @splat(0),
 };
 
 /// Must be a JSON number: std.json also parses strings with parseFloat, which can panic.
@@ -229,6 +231,7 @@ const JsonMonitor = struct {
     specialWorkspace: struct { id: JsonNum(i64) = .{ .v = 0 }, name: JsonStr = .{} } = .{},
     focused: bool = false,
     dpmsStatus: bool = true,
+    reserved: [4]JsonNum(i32) = @splat(.{ .v = 0 }),
 };
 
 /// Replaces invalid UTF-8 with '?': Hyprland's JSON can carry raw bytes (Latin-1 X11 titles).
@@ -275,6 +278,7 @@ pub fn parseMonitors(arena: std.mem.Allocator, json_in: []const u8) Error![]Moni
         .id = m.id.v,
         .special_workspace = m.specialWorkspace.name.s,
         .special_workspace_id = m.specialWorkspace.id.v,
+        .reserved = .{ m.reserved[0].v, m.reserved[1].v, m.reserved[2].v, m.reserved[3].v },
     };
     return out;
 }
