@@ -31,6 +31,7 @@ not in a package build tree. There is no compiler download during `make build`.
 | `make check` | Build server/plugin, check formatting and shell syntax, run Zig and Python tests |
 | `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
 | `make test-capture` | Compare DMA-BUF and SHM on a static `BASE` output in a test compositor |
+| `make test-window-fit` | Exercise floating-window recovery in a temporary nested compositor |
 | `make package` | Snapshot the working tree and build an Arch package |
 | `make install` | Build the package and install it through makepkg/pacman |
 | `make hyprland-package` | Build the separate patched compositor package |
@@ -56,6 +57,13 @@ It requires working DMA-BUF capture and a VA-API H.264 driver; it is separate fr
 For resize lifetime checks, set `OMASTATION_CAPTURE_TEST_ALLOW_RESIZE=1` with a
 private runtime directory under `/tmp`. This also changes the test output `BASE`
 to 960x641; it is not intended for a live desktop.
+
+`make test-window-fit` starts a separate Hyprland compositor with synthetic
+Quickshell windows and cleans it up afterwards. It checks a 2K-to-portrait resize,
+an inactive workspace, application minimum sizes, and preservation of windows
+that already fit or belong to another monitor. It also checks that growing the
+display does not enlarge windows. It needs Hyprland, Quickshell and one running
+Hyprland instance for the nested renderer; it does not resize the live desktop.
 
 The graphics log reports DMA-BUF frame counts, including partial updates, and
 `present->flush` p50/p95 latency. These measure compositor presentation to the

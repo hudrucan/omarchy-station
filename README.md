@@ -85,6 +85,12 @@ uses the separate image clipboard formats.
 `omastation --desktop`; the optional login service runs `omastation --login`.
 Client monitor size, scale and layout are negotiated on connection.
 
+After a display change, floating windows on the remote outputs are moved into
+the work area and shrunk only where they exceed it, including windows on inactive
+workspaces. Applications that require a larger minimum size keep their top-left
+corner reachable. Tiled and fullscreen windows follow Hyprland's layout. Growing
+the display does not restore earlier window sizes.
+
 Desktop capture uses linear DMA-BUF buffers when supported by the compositor and
 GPU, with shared-memory fallback. AVC420 updates can import these buffers directly
 into VA-API, including partial updates when all changes to the H.264 source fit

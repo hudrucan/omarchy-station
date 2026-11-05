@@ -21,6 +21,7 @@ const layouts = @import("../input/layouts.zig");
 const translate = @import("../input/translate.zig");
 const fastpath = @import("../proto/fastpath.zig");
 const cursor_mod = @import("cursor.zig");
+const window_fit = @import("window_fit.zig");
 
 const log = std.log.scoped(.desktop);
 
@@ -122,6 +123,8 @@ pub const Desktop = struct {
     scale_watch: bool = false,
     /// Own RDP output rules not yet reported back by the watch, by output.
     own_rules: [multimon.max_monitors]RuleQueue = @splat(.{}),
+    /// Debounce live resizing; allow asynchronous monitor rules a bounded settle time.
+    fit_windows: ?struct { after_ms: i64, deadline_ms: i64, phase: window_fit.Phase = .resize } = null,
 
     monitors: []const hypr.MonitorState = &.{},
     workspaces: []const hypr.WorkspaceState = &.{},
@@ -385,6 +388,7 @@ pub const Desktop = struct {
         });
 
         try d.connectWayland();
+        d.scheduleWindowFit();
     }
 
     fn connectWayland(d: *Desktop) Error!void {
@@ -838,6 +842,7 @@ pub const Desktop = struct {
         else
             console.planResize(arena.allocator(), d.monitors, .{ .width = d.fit.width, .height = d.fit.height, .scale = d.fit.scale() })) catch return;
         for (steps) |st| d.hyprCommand(st.cmd) catch |err| log.err("`{s}` failed: {t}", .{ st.cmd, err });
+        d.scheduleWindowFit();
         // The reload dropped the devices' output bindings too.
         if (d.touch_devs != 0) d.bindDevices();
     }
@@ -1023,6 +1028,7 @@ pub const Desktop = struct {
     const contested_check_ms = 200;
 
     pub fn tick(d: *Desktop) Tick {
+        d.fitWindows();
         d.refenceIfLost();
         d.keepAwake();
         d.pumpLock(nowMs());
@@ -1889,6 +1895,7 @@ pub const Desktop = struct {
         for (steps) |st| try d.hyprCommand(st.cmd);
         d.fit = fit;
         d.plan = singlePlan(fit, d.plan.outputs[0].x);
+        d.scheduleWindowFit();
         log.info("resized {s} to {d}x{d} scale {d:.4}", .{ console.rdp_output_name, fit.width, fit.height, fit.scale() });
         if (d.touch_mode != .off) d.reopenTouch();
     }
@@ -1934,6 +1941,7 @@ pub const Desktop = struct {
             d.setOutput(i, null);
         };
         d.plan = plan;
+        d.scheduleWindowFit();
         d.fit = outputFit(&plan, 0);
         d.layout = if (l.count > 1) l.* else null;
         if (d.pointer_on >= plan.count) d.pointer_on = 0;
@@ -1956,6 +1964,36 @@ pub const Desktop = struct {
             try client.flush();
         };
         if (d.touch_mode != .off) d.reopenTouch();
+    }
+
+    fn scheduleWindowFit(d: *Desktop) void {
+        const now = nowMs();
+        d.fit_windows = .{ .after_ms = now + 250, .deadline_ms = now + 2500 };
+    }
+
+    fn fitWindows(d: *Desktop) void {
+        const pending = d.fit_windows orelse return;
+        if (!d.entered or d.desk_owns) {
+            d.fit_windows = null;
+            return;
+        }
+        const now = nowMs();
+        if (now < pending.after_ms) return;
+        window_fit.apply(&d.ipc, d.gpa, &d.plan, pending.phase) catch |err| {
+            if (err == error.OutputNotReady and now < pending.deadline_ms) {
+                d.fit_windows.?.after_ms = now + 100;
+                return;
+            }
+            log.warn("fitting floating windows after a display change failed: {t}", .{err});
+            d.fit_windows = null;
+            return;
+        };
+        if (pending.phase == .resize) {
+            // A client can asynchronously enforce its minimum and re-center after
+            // resizing. Re-read its actual size, then place it without resizing again.
+            d.fit_windows.?.phase = .position;
+            d.fit_windows.?.after_ms = now + 250;
+        } else d.fit_windows = null;
     }
 
     pub fn onScancode(d: *Desktop, code: u8, flags: u8) Error!void {
