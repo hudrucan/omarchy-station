@@ -38,7 +38,7 @@ bench:
 	$(ZIG) build bench $(ZIG_BUILD_FLAGS) -- $(BENCH_ARGS)
 
 test-capture:
-	$(ZIG) build capbench $(ZIG_BUILD_FLAGS) -- --output BASE --mode dmabuf
+	$(ZIG) build capbench $(ZIG_BUILD_FLAGS) -- --output BASE --mode dmabuf --diff verify --frames 60 --warmup 3 --check-every 1
 
 test-window-fit:
 	ZIG="$(ZIG)" OPTIMIZE="$(OPTIMIZE)" JOBS="$(JOBS)" python3 tests/window_fit.py

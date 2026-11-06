@@ -49,9 +49,12 @@ test.
 The graphics log counts input events serviced during bounded VA-API waits.
 Graphics/control PDUs remain ordered with input. GPU capture and masked NV12
 conversion use the upstream Vulkan pipeline; `--no-gpu-capture` selects SHM.
+`present->flush` p50/p95 retains the latest 512 valid samples per log interval,
+measuring presentation to local socket flush, excluding network/client decoding.
 
-`make test-capture` runs the upstream `capbench` against a separate compositor's
-output named `BASE`. Set its `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`; the command
+`make test-capture` runs the upstream `capbench` with GPU/CPU diff verification
+against a separate compositor's moving output named `BASE`.
+Set its `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`; the command
 uses the same external build directory as `make build`. It is separate from
 `make check` and must not be pointed at a personal desktop.
 

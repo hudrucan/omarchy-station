@@ -89,6 +89,7 @@ const usage =
     \\                         and changes are found on the GPU (Vulkan), no copy of
     \\                         every frame to RAM; an output the GPU path cannot serve
     \\                         falls back to shared memory by itself
+    \\  --no-dmabuf            compatibility alias for --no-gpu-capture
     \\  --cursor MODE          who draws the pointer: auto (the client, once the
     \\                         compositor's cursor capture works; default), client
     \\                         (always), paint (painted into the frames)
@@ -541,7 +542,7 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
             i += 1;
         } else if (std.mem.eql(u8, a, "--gpu-capture")) {
             o.gpu_capture = true;
-        } else if (std.mem.eql(u8, a, "--no-gpu-capture")) {
+        } else if (std.mem.eql(u8, a, "--no-gpu-capture") or std.mem.eql(u8, a, "--no-dmabuf")) {
             o.gpu_capture = false;
         } else if (std.mem.eql(u8, a, "--test-capture")) {
             if (val.len == 0) return fail("bad --test-capture");
@@ -890,6 +891,14 @@ test "--gpu takes a render node path or its name under /dev/dri, and --codecs al
     try std.testing.expect(o.features.graphics.avc420);
 }
 
+test "--no-dmabuf retains the CPU-capture troubleshooting option" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var o: Options = .{};
+    try std.testing.expectEqual(Parsed.run, try parseOptions(arena.allocator(), &.{ "omastation", "--no-dmabuf" }, 1, &o));
+    try std.testing.expect(!o.gpu_capture);
+}
+
 test "--h264-encoder picks who codes H.264, and --codecs all keeps it" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -904,17 +913,38 @@ test "every option the usage text shows with a value consumes it" {
     // An option in the usage text without a sample here fails the test.
     const samples = [_]struct { []const u8, [:0]const u8 }{
         .{ "--session-starter", "/starter" },
-        .{ "--port", "3391" },              .{ "--cert", "/c" },                   .{ "--key", "/k" },
-        .{ "--credentials", "/x" },         .{ "--pam-service", "login" },         .{ "--user", "u" },
-        .{ "--lock-command", "true" },      .{ "--helper-socket", "/h" },          .{ "--reconnect-grace", "5" },
-        .{ "--alt-drag", "on" },            .{ "--heartbeat", "5" },               .{ "--hyprland-plugin", "none" },
-        .{ "--frame-interval", "31" },      .{ "--capture-backend", "wlr" },       .{ "--echo", "100" },
-        .{ "--codecs", "all" },             .{ "--lossy-motion", "auto" },         .{ "--bulk", "rdp61" },
-        .{ "--audio-quality", "dynamic" },  .{ "--audio-max-bandwidth", "22201" }, .{ "--remoteapp-launcher", "a --" },
-        .{ "--udp-version", "3" },          .{ "--mic-buffer-max", "300" },        .{ "--touch", "auto" },
-        .{ "--log-level", "info" },         .{ "--flight-record", "off" },         .{ "--test-video", "640x360" },
-        .{ "--test-scene", "scroll_busy" }, .{ "--cursor", "auto" },               .{ "--gpu", "renderD129" },
-        .{ "--h264-encoder", "software" },  .{ "--test-capture", "RDP-1" },
+        .{ "--port", "3391" },
+        .{ "--cert", "/c" },
+        .{ "--key", "/k" },
+        .{ "--credentials", "/x" },
+        .{ "--pam-service", "login" },
+        .{ "--user", "u" },
+        .{ "--lock-command", "true" },
+        .{ "--helper-socket", "/h" },
+        .{ "--reconnect-grace", "5" },
+        .{ "--alt-drag", "on" },
+        .{ "--heartbeat", "5" },
+        .{ "--hyprland-plugin", "none" },
+        .{ "--frame-interval", "31" },
+        .{ "--capture-backend", "wlr" },
+        .{ "--echo", "100" },
+        .{ "--codecs", "all" },
+        .{ "--lossy-motion", "auto" },
+        .{ "--bulk", "rdp61" },
+        .{ "--audio-quality", "dynamic" },
+        .{ "--audio-max-bandwidth", "22201" },
+        .{ "--remoteapp-launcher", "a --" },
+        .{ "--udp-version", "3" },
+        .{ "--mic-buffer-max", "300" },
+        .{ "--touch", "auto" },
+        .{ "--log-level", "info" },
+        .{ "--flight-record", "off" },
+        .{ "--test-video", "640x360" },
+        .{ "--test-scene", "scroll_busy" },
+        .{ "--cursor", "auto" },
+        .{ "--gpu", "renderD129" },
+        .{ "--h264-encoder", "software" },
+        .{ "--test-capture", "RDP-1" },
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

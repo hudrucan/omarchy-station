@@ -491,7 +491,10 @@ pub const Encoder = struct {
         var additional = [1]c.VASurfaceID{input};
         if (fused) |src| {
             var pp = pipelineParams(src);
-            if (region) |*r| pp.output_region = r;
+            if (region) |*r| {
+                pp.surface_region = r;
+                pp.output_region = r;
+            }
             pp.additional_outputs = &additional;
             pp.num_additional_outputs = 1;
             try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
@@ -724,7 +727,9 @@ pub const Encoder = struct {
         // input at an odd size (`paddedInput`).
         const nw = if (views or e.paddedInput()) e.geo.codedWidth() else w;
         const nh = if (views or e.paddedInput()) e.geo.codedHeight() else h;
-        if (!views) try createSurfaces(e.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, w, h, e.surfaces[src_surface..][0..1]);
+        const rw = (w + 1) & ~@as(u32, 1);
+        const rh = (h + 1) & ~@as(u32, 1);
+        if (!views) try createSurfaces(e.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, rw, rh, e.surfaces[src_surface..][0..1]);
         const inputs: usize = if (views) 2 else 1;
         try createSurfaces(e.dpy, c.VA_RT_FORMAT_YUV420, c.VA_FOURCC_NV12, nw, nh, e.surfaces[nv12_surface..][0..inputs]);
         try createSurfaces(e.dpy, c.VA_RT_FORMAT_YUV420, c.VA_FOURCC_NV12, nw, nh, e.surfaces[recon_base..][0..e.reconCount()]);
@@ -736,7 +741,7 @@ pub const Encoder = struct {
         if (!views and e.opts.conversion == .vpp) {
             if (!e.hasEntrypoint(c.VAProfileNone, c.VAEntrypointVideoProc)) return unsupported("video processing");
             try vaCheck(c.vaCreateConfig(e.dpy, c.VAProfileNone, c.VAEntrypointVideoProc, null, 0, &e.vpp_config), "vaCreateConfig(vpp)");
-            try vaCheck(c.vaCreateContext(e.dpy, e.vpp_config, @intCast(w), @intCast(h), c.VA_PROGRESSIVE, &e.surfaces[nv12_surface], 1, &e.vpp_ctx), "vaCreateContext(vpp)");
+            try vaCheck(c.vaCreateContext(e.dpy, e.vpp_config, @intCast(rw), @intCast(rh), c.VA_PROGRESSIVE, &e.surfaces[nv12_surface], 1, &e.vpp_ctx), "vaCreateContext(vpp)");
         }
 
         // Worst case: 3200 bits per macroblock (A.3.1) plus headers.
@@ -764,7 +769,7 @@ pub const Encoder = struct {
             e.image_derived = true;
         } else {
             var fmt: c.VAImageFormat = .{ .fourcc = c.VA_FOURCC_BGRX, .byte_order = c.VA_LSB_FIRST, .bits_per_pixel = 32 };
-            try vaCheck(c.vaCreateImage(e.dpy, &fmt, @intCast(w), @intCast(h), &e.image), "vaCreateImage");
+            try vaCheck(c.vaCreateImage(e.dpy, &fmt, @intCast(rw), @intCast(rh), &e.image), "vaCreateImage");
         }
     }
 
@@ -814,9 +819,17 @@ pub const Encoder = struct {
         } else {
             for (0..h) |y| @memcpy(base[y * pitch ..][0..row], pixels[y * stride ..][0..row]);
         }
+        const rw = (w + 1) & ~@as(u32, 1);
+        const rh = (h + 1) & ~@as(u32, 1);
+        // NV12 rectangles are even-sized. Replicate the last RGB pixel/row so
+        // drivers can convert 1:1 without rounding an odd rectangle and scaling.
+        if (w % 2 != 0) for (0..h) |y| {
+            @memcpy(base[y * pitch + row ..][0..4], base[y * pitch + row - 4 ..][0..4]);
+        };
+        if (h % 2 != 0) @memcpy(base[h * pitch ..][0 .. rw * 4], base[(h - 1) * pitch ..][0 .. rw * 4]);
         try vaCheck(c.vaUnmapBuffer(self.dpy, self.image.buf), "vaUnmapBuffer(image)");
         if (!self.image_derived) {
-            try vaCheck(c.vaPutImage(self.dpy, self.surfaces[src_surface], self.image.image_id, 0, 0, w, h, 0, 0, w, h), "vaPutImage");
+            try vaCheck(c.vaPutImage(self.dpy, self.surfaces[src_surface], self.image.image_id, 0, 0, rw, rh, 0, 0, rw, rh), "vaPutImage");
         }
     }
 
@@ -903,10 +916,10 @@ pub const Encoder = struct {
         return self.opts.avc444 == null and (self.opts.width % 2 != 0 or self.opts.height % 2 != 0);
     }
 
-    /// Where a BGRX picture goes in the NV12 input (null: all of it, no padding).
+    /// The picture plus one replicated edge if odd: NV12's rectangle must be even.
     fn inputRegion(self: *const Encoder) ?c.VARectangle {
         if (!self.paddedInput()) return null;
-        return .{ .x = 0, .y = 0, .width = @intCast(self.opts.width), .height = @intCast(self.opts.height) };
+        return .{ .x = 0, .y = 0, .width = @intCast((self.opts.width + 1) & ~@as(u32, 1)), .height = @intCast((self.opts.height + 1) & ~@as(u32, 1)) };
     }
 
     /// BGRX surface -> NV12 surface.
@@ -916,7 +929,12 @@ pub const Encoder = struct {
         var pp = pipelineParams(src);
         // Read by the driver in vaRenderPicture.
         const region = self.inputRegion();
-        if (region) |*r| pp.output_region = r;
+        if (region) |*r| {
+            // Exclude coded-size padding on both sides; otherwise VPP scales it
+            // into the logical picture, shifting pixels around moving windows.
+            pp.surface_region = r;
+            pp.output_region = r;
+        }
         try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
         try vaCheck(c.vaBeginPicture(self.dpy, self.vpp_ctx, self.surfaces[nv12_surface]), "vaBeginPicture(vpp)");
         const rs = c.vaRenderPicture(self.dpy, self.vpp_ctx, &bufs.ids, @intCast(bufs.n));
@@ -1235,6 +1253,38 @@ fn fillTestFrame(buf: []u8, w: u32, h: u32, frame: u32) void {
         const in_box = x >= frame * 8 and x < frame * 8 + 64 and y >= 40 and y < 104;
         p.* = if (in_box) .{ 0x20, 0x40, 0xe0, 0 } else .{ @truncate(x), @truncate(y), @truncate(x ^ y), 0 };
     };
+}
+
+test "GPU: bounded waits service their owner while preserving valid access units" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Owner = struct {
+        calls: usize = 0,
+        fn service(ctx: *anyopaque) void {
+            const owner: *@This() = @ptrCast(@alignCast(ctx));
+            owner.calls += 1;
+        }
+    };
+    var owner: Owner = .{};
+    var enc = try Encoder.init(gpa, .{ .width = 978, .height = 644, .rate_control = .cqp, .verify = true, .wait_hook = .{ .ctx = &owner, .func = Owner.service } });
+    defer enc.deinit();
+    const pixels = try gpa.alloc(u8, 978 * 644 * 4);
+    defer gpa.free(pixels);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var params: bs.ParamSets = .{};
+    for (0..4) |i| {
+        fillTestFrame(pixels, 978, 644, @intCast(i));
+        out.clearRetainingCapacity();
+        const before = owner.calls;
+        const frame = try enc.encode(pixels, 978 * 4, false, &out);
+        try testing.expect(owner.calls > before);
+        const au = try bs.inspect(out.items, params);
+        params = au.params;
+        try testing.expectEqual(@as(u32, 1), au.pictures);
+        try testing.expectEqual(i == 0, frame.idr);
+        try testing.expectEqual(@as(u32, @intCast(i)), au.first_slice.?.frame_num);
+    }
 }
 
 test "GPU: VBR and CBR report bounded average QP across bitrate changes" {

@@ -1533,6 +1533,35 @@ pub const Conn = struct {
     }
 };
 
+test "encode input hook handles keyboard batches, defers controls and preserves read errors" {
+    const t = std.testing;
+    var conn = Conn.init(t.allocator, transport_mod.Transport.init(-1), undefined, undefined, null, "input-test");
+    defer conn.enc.deinit();
+    defer conn.input_pump.deinit(t.allocator);
+    const packets = [_]u8{ 0x10, 10, 0, 0x1d, 0, 0x1e, 1, 0x1e, 1, 0x1d, 3, 0, 0, 7, 2, 0xf0, 0x80 };
+    @memcpy(conn.t.buf[0..packets.len], &packets);
+    conn.t.end = packets.len;
+    conn.t.nonblocking = true;
+    conn.encode_input_enabled = true;
+    conn.dispatching_input = true;
+    Conn.pumpEncodeInput(&conn);
+    try t.expectEqual(@as(usize, 0), conn.t.start);
+    conn.dispatching_input = false;
+    Conn.pumpEncodeInput(&conn);
+    try t.expectEqual(@as(u64, 4), conn.input_events);
+    try t.expectEqual(@as(u64, 4), conn.ch.stats.encode_input_events);
+    try t.expect(conn.encode_input_error == null);
+    try t.expect(conn.input_pump.pending());
+    @memset(&conn.t.buf, 0xff);
+    const control = (try conn.input_pump.next(&conn.t)).?;
+    try t.expectEqual(.tpkt, control.kind);
+    try t.expectEqualSlices(u8, &.{ 3, 0, 0, 7, 2, 0xf0, 0x80 }, control.data);
+    conn.t.start = 0;
+    conn.t.end = 1;
+    Conn.pumpEncodeInput(&conn);
+    try t.expectEqual(@as(Error, error.BadFrame), conn.encode_input_error.?);
+}
+
 /// Most update data in one slow-path Update PDU (MS-RDPBCGR 2.2.9.1.1.3): PER length <= 0x3FFF.
 pub const max_slow_update = 0x3FFF - rdp.data_header_len;
 
