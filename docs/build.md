@@ -12,7 +12,10 @@ On Omarchy, `./install-omarchy` installs dependencies and the built package. To
 prepare a development machine without installing Omastation:
 
 ```sh
-omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+omarchy pkg add \
+  base-devel mise python hyprland uwsm jq openssl pam libva \
+  mesa vulkan-headers vulkan-icd-loader openh264 \
+  libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 mise trust
 mise install
 ```
@@ -21,6 +24,11 @@ On Arch without Omarchy, install the same dependency list through pacman.
 `mise.toml` pins Zig; `build.zig.zon` declares the minimum supported version and
 the server version. The compiler lives in mise's shared installation directory,
 not in a package build tree. There is no compiler download during `make build`.
+
+Vulkan and OpenH264 headers are needed to build even when a particular machine
+uses shared-memory capture or VA-API encoding. OpenH264's library is loaded at
+runtime when software H.264 is selected. Install the appropriate Vulkan and
+VA-API drivers for your GPU to use hardware acceleration.
 
 ## Commands
 

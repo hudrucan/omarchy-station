@@ -11,6 +11,7 @@ fi
 
 omarchy pkg add \
   base-devel mise python hyprland uwsm jq openssl pam libva \
+  mesa vulkan-headers vulkan-icd-loader openh264 \
   libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 
 mise trust "$repo_dir/mise.toml"
