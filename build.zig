@@ -1,9 +1,9 @@
 const std = @import("std");
 
-pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "gbm", "drm", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
+pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "gbm", "vulkan", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
 
 // For translate-c: headers outside /usr/include.
-const system_include_dirs = [_][]const u8{ "/usr/include/pipewire-0.3", "/usr/include/spa-0.2", "/usr/include/libdrm" };
+const system_include_dirs = [_][]const u8{ "/usr/include/pipewire-0.3", "/usr/include/spa-0.2" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -67,18 +67,27 @@ pub fn build(b: *std.Build) void {
     run_bench.addPassthruArgs();
     b.step("bench", "Time the CPU codecs (RemoteFX, progressive) on synthetic frames").dependOn(&run_bench.step);
 
-    const capture_test = b.addExecutable(.{
-        .name = "omastation-capture-test",
+    // `zig build capbench -- --output NAME --mode dmabuf`: what capturing an output costs, the
+    // compositor's side included (src/capbench.zig); run it against a nested compositor.
+    const capbench = b.addExecutable(.{
+        .name = "omastation-capbench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/capture.zig"),
+            .root_source_file = b.path("src/capbench.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .imports = &.{.{ .name = "omastation", .module = lib_mod }},
+            .imports = &.{
+                .{ .name = "omastation", .module = lib_mod },
+                .{ .name = "c", .module = c_mod },
+            },
         }),
     });
-    const run_capture_test = b.addRunArtifact(capture_test);
-    b.step("test-capture", "Compare DMA-BUF and SHM capture on a static test output").dependOn(&run_capture_test.step);
+    for (system_libs) |l| capbench.root_module.linkSystemLibrary(l, .{});
+    const run_capbench = b.addRunArtifact(capbench);
+    run_capbench.addPassthruArgs();
+    const capbench_step = b.step("capbench", "Measure output capture (shm or dmabuf) against WAYLAND_DISPLAY");
+    capbench_step.dependOn(&b.addInstallArtifact(capbench, .{}).step);
+    capbench_step.dependOn(&run_capbench.step);
 
     const window_fit_test = b.addExecutable(.{
         .name = "omastation-window-fit-test",

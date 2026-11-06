@@ -12,7 +12,7 @@ On Omarchy, `./install-omarchy` installs dependencies and the built package. To
 prepare a development machine without installing Omastation:
 
 ```sh
-omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libdrm mesa libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+omarchy pkg add base-devel mise python hyprland uwsm jq openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
 mise trust
 mise install
 ```
@@ -30,7 +30,7 @@ not in a package build tree. There is no compiler download during `make build`.
 | `make plugin` | Build the native plugin against installed Hyprland |
 | `make check` | Build server/plugin, check formatting and shell syntax, run Zig and Python tests |
 | `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
-| `make test-capture` | Compare DMA-BUF and SHM on a static `BASE` output in a test compositor |
+| `make test-capture` | Run the upstream DMA-BUF capture benchmark on an isolated `BASE` output |
 | `make test-window-fit` | Exercise floating-window recovery in a temporary nested compositor |
 | `make package` | Snapshot the working tree and build an Arch package |
 | `make install` | Build the package and install it through makepkg/pacman |
@@ -46,17 +46,17 @@ They do not enable units, change login settings or establish a real remote deskt
 session. A successful check is not a live client compatibility or display-isolation
 test.
 
-`make test-capture` is an optional GPU integration test for a static output
-named `BASE` in a separate test compositor. It compares DMA-BUF pixels against
-shared-memory capture, exercises VA-API import, and reports static-frame timings.
-It also checks import-cache reuse and invalidation, deferred CPU reference images,
-and retained-buffer lifetime after capture and Wayland-client teardown.
-It requires working DMA-BUF capture and a VA-API H.264 driver; it is separate from
-`make check`. Run it with the test compositor's `WAYLAND_DISPLAY` and
-`XDG_RUNTIME_DIR`; it uses the same external build directory as `make build`.
-For resize lifetime checks, set `OMASTATION_CAPTURE_TEST_ALLOW_RESIZE=1` with a
-private runtime directory under `/tmp`. This also changes the test output `BASE`
-to 960x641; it is not intended for a live desktop.
+The graphics log counts input events serviced during bounded VA-API waits.
+Graphics/control PDUs remain ordered with input. GPU capture and masked NV12
+conversion use the upstream Vulkan pipeline; `--no-gpu-capture` selects SHM.
+`present->flush` p50/p95 retains the latest 512 valid samples per log interval,
+measuring presentation to local socket flush, excluding network/client decoding.
+
+`make test-capture` runs the upstream `capbench` with GPU/CPU diff verification
+against a separate compositor's moving output named `BASE`.
+Set its `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`; the command
+uses the same external build directory as `make build`. It is separate from
+`make check` and must not be pointed at a personal desktop.
 
 `make test-window-fit` starts a separate Hyprland compositor with synthetic
 Quickshell windows and cleans it up afterwards. It checks a 2K-to-portrait resize,
@@ -65,18 +65,6 @@ that already fit or belong to another monitor. It also checks that growing the
 display does not enlarge windows. It needs Hyprland, Quickshell and one running
 Hyprland instance for the nested renderer; it does not resize the live desktop.
 
-The graphics log reports DMA-BUF frame counts, including partial updates, and
-`present->flush` p50/p95 latency. These measure compositor presentation to the
-server's local socket flush, excluding network transit and client decoding.
-Each five-second interval retains at most its latest 512 latency samples; frames
-without a valid presentation timestamp are omitted. This helps compare latency
-when both builds already reach the display's frame rate.
-
-The same log counts input events serviced during bounded VA-API waits and stale
-captures replaced before encoding. Capture can run one frame ahead once the
-previous RGB reference is safe to reuse. The latest unencoded picture is retained
-under backpressure, including the final picture when the screen stops changing;
-encoded H.264 pictures are never dropped. Control PDUs remain ordered with input.
 
 For fewer parallel jobs or another build location:
 

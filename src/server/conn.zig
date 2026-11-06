@@ -75,8 +75,9 @@ pub const DesktopConfig = struct {
     binds_state_path: ?[:0]const u8 = null,
     console_state_path: ?[:0]const u8 = null,
     capture_backend: wl_capture.Backend = .ext,
-    capture_dmabuf: bool = true,
     cursor: desktop_mod.CursorMode = .auto,
+    /// Capture into dmabufs, changes found on the GPU (src/gpu/capture.zig).
+    gpu_capture: bool = false,
 };
 
 /// Covers clients' auto-reconnect attempts (about 20, 5 s apart) plus drop detection on both sides.
@@ -154,6 +155,8 @@ pub const Conn = struct {
     width: u16 = 0,
     height: u16 = 0,
     deadline: deadline.Handle = .{},
+    /// When the connection sequence began (the connection was taken up).
+    sequence_start_ms: i64 = 0,
     netchar: autodetect.State = .{},
     bulk: compression.State = .{},
     /// Finalization done (Font Map sent).
@@ -193,21 +196,18 @@ pub const Conn = struct {
     encode_input_enabled: bool = false,
     dispatching_input: bool = false,
     encode_input_error: ?Error = null,
-    capture_active: ?*const wl_capture.Frame = null,
-    capture_ahead: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, t: transport_mod.Transport, tls_ctx: *tls.Context, auth_cfg: *const AuthConfig, desktop_cfg: ?*const DesktopConfig, peer: []const u8) Conn {
         return .{ .gpa = gpa, .t = t, .tls_ctx = tls_ctx, .auth_cfg = auth_cfg, .desktop_cfg = desktop_cfg, .seat = if (desktop_cfg) |d| d.seat else null, .peer = peer, .enc = encoder_mod.Encoder.init(gpa) };
     }
 
     pub fn deinit(self: *Conn) void {
-        // Capture references must be released while their Wayland connection is alive.
-        self.ch.surf.clearDmaReference();
-        for (&self.surfaces.slots) |*slot| if (slot.*) |*s| s.surf.clearDmaReference();
         self.wipeSecret();
         self.lingering = self.mayLinger();
         // The features first: they may use the desktop.
         vc.deinit(self);
+        // The encoder's links to the desktop's GPU capture, while this thread still owns it.
+        self.enc.releaseShadow();
         // Hand the desktop to a connection taking over, or lock and give the console back, first.
         if (self.claim) |*cl| {
             const seat = self.desktop_cfg.?.seat;
@@ -458,7 +458,8 @@ pub const Conn = struct {
     }
 
     pub fn run(self: *Conn) Error!void {
-        self.deadline = deadline.start(self.t.fd, nowMs());
+        self.sequence_start_ms = nowMs();
+        self.deadline = deadline.start(self.t.fd, self.sequence_start_ms);
         try self.negotiate();
         try self.mcsConnect();
         try self.channelJoins();
@@ -891,8 +892,8 @@ pub const Conn = struct {
             .binds_state_path = cfg.binds_state_path,
             .console_state_path = cfg.console_state_path,
             .capture_backend = cfg.capture_backend,
-            .capture_dmabuf = cfg.capture_dmabuf,
             .cursor = cfg.cursor,
+            .gpu_capture = cfg.gpu_capture,
             .layout = layout,
             .recovery_marker = cfg.recovery_marker,
         };
@@ -1169,15 +1170,6 @@ pub const Conn = struct {
         self.ch.stats.encode_input_events += self.input_events - before;
     }
 
-    /// Once the next H.264 RGB source is prepared, the older capture can be reused.
-    pub fn prefetchCapture(self: *Conn) Error!void {
-        const frame = self.capture_active orelse return;
-        if (self.capture_ahead) return;
-        try self.ch.surf.finishCapture(self.gpa, frame.dma);
-        try self.desktop.?.requestFrame();
-        self.capture_ahead = true;
-    }
-
     /// Test pattern: 3 s of motion, 2 s still; with `test_video`, a 30 fps video 15 s of every 20.
     fn pumpAnimation(self: *Conn) Error!void {
         if (!self.established or self.output_suppressed or self.reactivating) return;
@@ -1222,20 +1214,13 @@ pub const Conn = struct {
         if (surfaces.isMulti(self)) {
             if (!try surfaces.pump(self, d)) return;
         } else {
-            const pending = d.latestFrame() orelse return;
-            if (pending.replaced) self.ch.stats.capture_replaced += 1;
             if (!channels.canSendFrame(self)) {
-                if (self.pacing.refused) self.pacing.held() else self.ch.stats.blocked += 1;
-                // Keep the last picture available if the screen stops changing while blocked.
-                // Only refresh a stale capture; normal frame pacing must not force a CPU snapshot.
-                if (pending.age_ns >= 2 * @as(u64, self.pacing.interval_ms) * std.time.ns_per_ms) {
-                    try self.ch.surf.finishCapture(self.gpa, pending.frame.dma);
-                    try d.requestFrame();
+                if (d.frameReady()) {
+                    if (self.pacing.refused) self.pacing.held() else self.ch.stats.blocked += 1;
                 }
                 return;
             }
-            const f = pending.frame;
-            if (f.dma) |buffer| try buffer.beginRead();
+            const f = d.takeFrame() orelse return;
             if (f.width != d.width() or f.height != d.height()) {
                 // RDP-1 is briefly at another mode (Hyprland's rule after a config reload): skip unless it lasts.
                 const now = nowMs();
@@ -1243,8 +1228,6 @@ pub const Conn = struct {
                 self.odd_size_since_ms = since;
                 if (now - since < self.odd_size_grace_ms) {
                     log.debug("{s}: skipping a {d}x{d} frame (the session is {d}x{d})", .{ self.peer, f.width, f.height, d.width(), d.height() });
-                    try self.ch.surf.finishCapture(self.gpa, f.dma);
-                    d.consumeFrame();
                     return d.requestFrame();
                 }
                 if (!self.odd_size_taken) {
@@ -1255,17 +1238,12 @@ pub const Conn = struct {
                 self.odd_size_since_ms = null;
                 self.odd_size_taken = false;
             }
-            self.capture_active = f;
-            self.capture_ahead = false;
-            defer self.capture_active = null;
-            channels.sendDesktopFrame(self, f) catch |err| switch (err) {
+            channels.sendDesktopFrame(self, f, d.frameSource(0).gpu()) catch |err| switch (err) {
                 // A malformed frame is skipped; the client keeps its picture.
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame with stride {d} and {d} bytes", .{ self.peer, f.width, f.height, f.stride, f.data.len }),
                 else => return err,
             };
-            try self.ch.surf.finishCapture(self.gpa, f.dma);
-            if (!self.capture_ahead) try d.requestFrame();
-            d.consumeFrame();
+            try d.requestFrame();
         }
         if (self.secret) |sec| {
             // The client now sees the lock screen (if any): unlock it.
@@ -1322,9 +1300,9 @@ pub const Conn = struct {
                     try self.sendIo(rdp.writeFontMap, .{});
                 }
                 if (self.reactivating) {
-                    // Reactivated (1.3.1.3): the whole picture again.
+                    // Reactivated (1.3.1.3): the whole picture again, or another reactivation.
                     self.reactivating = false;
-                    return channels.refresh(self);
+                    return channels.reactivated(self);
                 }
                 deadline.stop(&self.deadline);
                 log.info("{s}: connection established", .{self.peer});
@@ -1560,7 +1538,6 @@ test "encode input hook handles keyboard batches, defers controls and preserves 
     var conn = Conn.init(t.allocator, transport_mod.Transport.init(-1), undefined, undefined, null, "input-test");
     defer conn.enc.deinit();
     defer conn.input_pump.deinit(t.allocator);
-    // Ctrl down, A down/up, Ctrl up; then a control PDU handled after encoding.
     const packets = [_]u8{ 0x10, 10, 0, 0x1d, 0, 0x1e, 1, 0x1e, 1, 0x1d, 3, 0, 0, 7, 2, 0xf0, 0x80 };
     @memcpy(conn.t.buf[0..packets.len], &packets);
     conn.t.end = packets.len;
@@ -1582,7 +1559,6 @@ test "encode input hook handles keyboard batches, defers controls and preserves 
     conn.t.start = 0;
     conn.t.end = 1;
     Conn.pumpEncodeInput(&conn);
-    try t.expect(conn.encode_input_error != null);
     try t.expectEqual(@as(Error, error.BadFrame), conn.encode_input_error.?);
 }
 

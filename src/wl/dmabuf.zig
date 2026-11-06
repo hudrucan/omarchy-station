@@ -1,224 +1,181 @@
-//! Linear, CPU-readable capture buffers shared with Wayland and VA-API.
-//! Async wl_buffer creation lets unsupported imports fall back without a protocol error.
+//! Dmabuf capture buffers: the compositor renders the frame into GPU memory the client allocated,
+//! so it never copies the frame to RAM. Allocation is injected (`Allocator`): the GPU library
+//! (GBM, src/gpu/gbm.zig) stays outside this pure-Zig client, and tests pass memfds.
+
 const std = @import("std");
-const c = @import("c");
 const wire = @import("wire.zig");
 const sys = @import("sys.zig");
 const P = wire.proto;
-const dma = @import("../core/dmabuf.zig");
-var next_buffer_id: std.atomic.Value(u64) = .init(1);
 
-pub const xrgb8888 = dma.xrgb8888;
-pub const argb8888 = dma.argb8888;
-pub const Hook = struct { ctx: *anyopaque, func: *const fn (*anyopaque) void };
+pub const Error = wire.Error || AllocError;
+pub const AllocError = error{ AllocFailed, NoDevice, Unsupported };
 
-pub const Buffer = struct {
-    id: u64 = 0,
-    bo: *c.struct_gbm_bo,
-    fd: c_int,
+/// DRM fourcc codes (drm_fourcc.h) of the 32-bit RGB formats capture accepts.
+pub const format_xrgb8888: u32 = 0x34325258; // XR24: B,G,R,X bytes
+pub const format_argb8888: u32 = 0x34325241; // AR24: B,G,R,A bytes
+pub const format_xbgr8888: u32 = 0x34324258; // XB24: R,G,B,X bytes
+pub const format_abgr8888: u32 = 0x34324241; // AB24: R,G,B,A bytes
+
+pub const mod_linear: u64 = 0;
+/// DRM_FORMAT_MOD_INVALID: "implicit layout". Never allocate with it: a buffer whose layout the
+/// importer has to guess is how a GPU page fault happens.
+pub const mod_invalid: u64 = 0x00ff_ffff_ffff_ffff;
+
+/// The wl_shm format with the same memory layout (wl_shm's two legacy codes differ from DRM's).
+pub fn shmFormat(drm: u32) P.WlShm.Format {
+    return switch (drm) {
+        format_xrgb8888 => .xrgb8888,
+        format_argb8888 => .argb8888,
+        else => @fromBackingInt(@intCast(drm)),
+    };
+}
+
+pub const Plane = struct {
+    fd: sys.Fd,
+    offset: u32,
+    stride: u32,
+};
+
+/// One allocated buffer. The allocator owns `handle` and the plane fds.
+pub const Bo = struct {
+    handle: ?*anyopaque = null,
     width: u32,
     height: u32,
-    stride: u32,
     format: u32,
-    data: []u8,
-    proxy: ?P.WlBuffer = null,
-    params: ?P.ZwpLinuxBufferParamsV1 = null,
-    requested: bool = false,
-    pool: *Pool,
-    reading: bool = false,
+    modifier: u64,
+    planes: [4]Plane = undefined,
+    nplanes: u8,
+};
 
-    pub fn descriptor(b: *const Buffer) dma.Frame {
-        return .{ .id = b.id, .fd = b.fd, .width = b.width, .height = b.height, .stride = b.stride, .format = b.format, .size = @intCast(b.data.len) };
-    }
+pub const Allocator = struct {
+    ctx: *anyopaque,
+    /// `device`: the dev_t the compositor named (dmabuf_device); `modifiers`: those it accepts
+    /// for `format`, never empty and never containing `mod_invalid`.
+    allocFn: *const fn (ctx: *anyopaque, device: u64, width: u32, height: u32, format: u32, modifiers: []const u64) AllocError!Bo,
+    freeFn: *const fn (ctx: *anyopaque, bo: *Bo) void,
+    /// Why the last allocFn failed, in words (device, driver, what was asked); null: no detail.
+    whyFn: ?*const fn (ctx: *anyopaque) []const u8 = null,
 
-    pub fn retain(b: *Buffer) void {
-        b.pool.refs += 1;
-    }
-
-    pub fn release(b: *Buffer) void {
-        b.pool.release();
-    }
-
-    pub fn beginRead(b: *Buffer) wire.Error!void {
-        if (b.reading) return;
-        try sync(b.fd, c.DMA_BUF_SYNC_START | c.DMA_BUF_SYNC_READ);
-        b.reading = true;
-    }
-
-    pub fn endRead(b: *Buffer) wire.Error!void {
-        if (!b.reading) return;
-        try sync(b.fd, c.DMA_BUF_SYNC_END | c.DMA_BUF_SYNC_READ);
-        b.reading = false;
-    }
-
-    fn onParams(b: *Buffer, msg: *wire.Message) wire.Error!void {
-        switch (try msg.decode(P.ZwpLinuxBufferParamsV1)) {
-            .created => |v| b.proxy = v.buffer,
-            .failed => b.pool.failed = true,
-        }
-        if (b.params) |p| try p.destroy(b.pool.conn);
-        b.params = null;
-        b.pool.pending -= 1;
-        if (b.pool.pending == 0) b.pool.hook.func(b.pool.hook.ctx);
+    pub fn why(a: *const Allocator) ?[]const u8 {
+        const f = a.whyFn orelse return null;
+        const text = f(a.ctx);
+        return if (text.len == 0) null else text;
     }
 };
 
-pub const Pool = struct {
-    gpa: std.mem.Allocator,
-    conn: *wire.Connection,
-    device: *c.struct_gbm_device,
-    drm_fd: c_int,
-    device_id: u64,
-    buffers: [2]Buffer = undefined,
-    count: usize = 0,
-    pending: usize = 0,
-    failed: bool = false,
-    hook: Hook,
-    refs: usize = 1,
+/// The modifiers to allocate with: LINEAR alone when offered and preferred (every importer reads
+/// it), else every explicit one offered (the allocator picks); none if only implicit is offered.
+pub fn chooseModifiers(offered: []const u64, prefer_linear: bool, out: []u64) []const u64 {
+    if (prefer_linear) for (offered) |m| if (m == mod_linear) {
+        out[0] = mod_linear;
+        return out[0..1];
+    };
+    var n: usize = 0;
+    for (offered) |m| {
+        if (m == mod_invalid or n == out.len) continue;
+        out[n] = m;
+        n += 1;
+    }
+    return out[0..n];
+}
 
-    pub fn create(gpa: std.mem.Allocator, conn: *wire.Connection, manager: P.ZwpLinuxDmabufV1, dev: u64, width: u32, height: u32, format: u32, hook: Hook) wire.Error!*Pool {
-        if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidArgument;
-        const fd = try openRenderNode(dev);
-        errdefer sys.close(fd);
-        const device = c.gbm_create_device(fd) orelse return error.Unsupported;
-        errdefer c.gbm_device_destroy(device);
-        const pool = try gpa.create(Pool);
-        pool.* = .{ .gpa = gpa, .conn = conn, .device = device, .drm_fd = fd, .device_id = dev, .hook = hook };
+pub const BufferSet = struct {
+    alloc: *const Allocator,
+    bos: [max_buffers]Bo = undefined,
+    proxies: [max_buffers]P.WlBuffer = undefined,
+    count: usize,
+    width: u32,
+    height: u32,
+    format: u32,
+
+    pub const max_buffers = 4;
+
+    pub fn create(
+        conn: *wire.Connection,
+        linux_dmabuf: P.ZwpLinuxDmabufV1,
+        alloc: *const Allocator,
+        device: u64,
+        count: usize,
+        width: u32,
+        height: u32,
+        format: u32,
+        modifiers: []const u64,
+    ) Error!BufferSet {
+        std.debug.assert(count >= 1 and count <= max_buffers);
+        if (width == 0 or height == 0 or width > 16384 or height > 16384 or modifiers.len == 0) return error.InvalidArgument;
+        var set: BufferSet = .{ .alloc = alloc, .count = 0, .width = width, .height = height, .format = format };
+        var nproxies: usize = 0;
         errdefer {
-            pool.destroyBuffers();
-            gpa.destroy(pool);
+            for (set.proxies[0..nproxies]) |p| p.destroy(conn) catch {};
+            for (set.bos[0..set.count]) |*bo| alloc.freeFn(alloc.ctx, bo);
         }
-        const aw = (width + 15) & ~@as(u32, 15);
-        const ah = (height + 15) & ~@as(u32, 15);
-        for (&pool.buffers) |*b| {
-            const bo = c.gbm_bo_create(device, aw, ah, format, c.GBM_BO_USE_RENDERING | c.GBM_BO_USE_LINEAR) orelse return error.Unsupported;
-            const dma_fd = c.gbm_bo_get_fd(bo);
-            if (dma_fd < 0 or c.gbm_bo_get_modifier(bo) != 0 or c.gbm_bo_get_plane_count(bo) != 1 or c.gbm_bo_get_offset(bo, 0) != 0) {
-                sys.close(dma_fd);
-                c.gbm_bo_destroy(bo);
-                return error.Unsupported;
+        for (0..count) |k| {
+            set.bos[k] = try alloc.allocFn(alloc.ctx, device, width, height, format, modifiers);
+            set.count = k + 1;
+            const bo = &set.bos[k];
+            if (bo.modifier == mod_invalid or bo.nplanes == 0 or bo.nplanes > 4) return error.AllocFailed;
+            const params = try linux_dmabuf.createParams(conn);
+            for (bo.planes[0..bo.nplanes], 0..) |p, i| {
+                try params.add(conn, p.fd, @intCast(i), p.offset, p.stride, @truncate(bo.modifier >> 32), @truncate(bo.modifier));
             }
-            const stride = c.gbm_bo_get_stride(bo);
-            const len = @as(usize, stride) * ah;
-            const mem = std.c.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, dma_fd, 0);
-            if (mem == std.c.MAP_FAILED) {
-                sys.close(dma_fd);
-                c.gbm_bo_destroy(bo);
-                return error.Unsupported;
-            }
-            b.* = .{ .id = next_buffer_id.fetchAdd(1, .monotonic), .bo = bo, .fd = dma_fd, .width = aw, .height = ah, .stride = stride, .format = format, .data = @as([*]u8, @ptrCast(mem))[0..len], .pool = pool };
-            pool.count += 1;
-            try sync(dma_fd, c.DMA_BUF_SYNC_START | c.DMA_BUF_SYNC_WRITE);
-            @memset(b.data, 0);
-            try sync(dma_fd, c.DMA_BUF_SYNC_END | c.DMA_BUF_SYNC_WRITE);
-            const params = try manager.createParams(conn);
-            b.params = params;
-            conn.setHandler(params.id, wire.Handler.init(Buffer, b, Buffer.onParams));
-            try params.add(conn, dma_fd, 0, 0, stride, 0, 0);
-            try params.create(conn, @intCast(width), @intCast(height), format, 0);
-            b.requested = true;
-            pool.pending += 1;
+            // Only formats and modifiers the capture session advertised get here, so create_immed
+            // (no failure event to wait for) is safe.
+            set.proxies[k] = try params.createImmed(conn, @intCast(width), @intCast(height), format, 0);
+            nproxies = k + 1;
+            try params.destroy(conn);
         }
-        return pool;
+        return set;
     }
 
-    fn retireBuffers(pool: *Pool) void {
-        for (pool.buffers[0..pool.count]) |*b| {
-            if (b.params) |p| {
-                if (b.requested) {
-                    // A resize can retire a pool before created/failed arrives. Keep
-                    // only the connection as callback context, never the freed buffer.
-                    pool.conn.setHandler(p.id, wire.Handler.init(wire.Connection, pool.conn, discardParams));
-                } else p.destroy(pool.conn) catch {};
-            }
-            b.params = null;
-            if (b.proxy) |p| p.destroy(pool.conn) catch {};
-            b.proxy = null;
-        }
+    pub fn stride(set: *const BufferSet) u32 {
+        return set.bos[0].planes[0].stride;
     }
 
-    fn destroyBuffers(pool: *Pool) void {
-        pool.retireBuffers();
-        for (pool.buffers[0..pool.count]) |*b| {
-            b.endRead() catch {};
-            _ = std.c.munmap(@ptrCast(@alignCast(b.data.ptr)), b.data.len);
-            sys.close(b.fd);
-            c.gbm_bo_destroy(b.bo);
-        }
+    pub fn modifier(set: *const BufferSet) u64 {
+        return set.bos[0].modifier;
     }
 
-    pub fn destroy(pool: *Pool) void {
-        // Only the capture owner owns protocol objects. Retained CPU references
-        // can outlive the Wayland client, but keep no callbacks into that client.
-        pool.retireBuffers();
-        pool.release();
+    pub fn matches(set: *const BufferSet, width: u32, height: u32, format: u32) bool {
+        return set.width == width and set.height == height and set.format == format;
     }
 
-    fn release(pool: *Pool) void {
-        std.debug.assert(pool.refs > 0);
-        pool.refs -= 1;
-        if (pool.refs != 0) return;
-        pool.destroyBuffers();
-        c.gbm_device_destroy(pool.device);
-        sys.close(pool.drm_fd);
-        pool.gpa.destroy(pool);
+    pub fn destroy(set: *BufferSet, conn: *wire.Connection) void {
+        for (set.proxies[0..set.count]) |p| p.destroy(conn) catch {};
+        for (set.bos[0..set.count]) |*bo| set.alloc.freeFn(set.alloc.ctx, bo);
+        set.* = undefined;
     }
 };
 
-fn discardParams(conn: *wire.Connection, msg: *wire.Message) wire.Error!void {
-    switch (try msg.decode(P.ZwpLinuxBufferParamsV1)) {
-        .created => |v| try v.buffer.destroy(conn),
-        .failed => {},
-    }
-    try (P.ZwpLinuxBufferParamsV1{ .id = msg.object }).destroy(conn);
+/// dmabuf_device carries a dev_t as raw bytes in host order.
+pub fn parseDevice(bytes: []const u8) ?u64 {
+    if (bytes.len != @sizeOf(u64)) return null;
+    return std.mem.bytesToValue(u64, bytes[0..8]);
 }
 
-fn sync(fd: c_int, flags: u64) wire.Error!void {
-    var value: c.struct_dma_buf_sync = .{ .flags = flags };
-    while (c.ioctl(fd, c.DMA_BUF_IOCTL_SYNC, &value) != 0) {
-        switch (std.c.errno(-1)) {
-            .INTR, .AGAIN => continue,
-            else => return error.Unsupported,
-        }
-    }
+/// glibc's major()/minor() for a Linux dev_t.
+pub fn devMajor(dev: u64) u32 {
+    return @truncate(((dev >> 8) & 0xfff) | ((dev >> 32) & ~@as(u64, 0xfff)));
 }
 
-fn openRenderNode(device: u64) wire.Error!c_int {
-    // The compositor can announce either node of a GPU; resolve its render node.
-    var dev: c.drmDevicePtr = null;
-    if (c.drmGetDeviceFromDevId(device, 0, &dev) != 0) return error.Unsupported;
-    defer c.drmFreeDevice(&dev);
-    if (dev.*.available_nodes & (@as(c_int, 1) << c.DRM_NODE_RENDER) == 0) return error.Unsupported;
-    const fd = c.open(dev.*.nodes[c.DRM_NODE_RENDER], c.O_RDWR | c.O_CLOEXEC);
-    return if (fd < 0) error.Unsupported else fd;
+pub fn devMinor(dev: u64) u32 {
+    return @truncate((dev & 0xff) | ((dev >> 12) & ~@as(u64, 0xff)));
 }
 
-test "retired DMA-BUF imports destroy late buffers and params without pool state" {
-    const t = std.testing;
-    for ([_]bool{ false, true }) |created| {
-        const sockets = try sys.socketPair();
-        const conn = try wire.Connection.initFd(t.allocator, sockets[0]);
-        defer conn.deinit();
-        const peer = try wire.Connection.initFd(t.allocator, sockets[1]);
-        defer peer.deinit();
-        const params = try conn.newIdVersioned(.zwp_linux_buffer_params_v1, 3);
-        conn.setHandler(params, wire.Handler.init(wire.Connection, conn, discardParams));
-        if (created) {
-            try peer.request(params, 0, &.{.{ .new_id = wire.server_id_start }});
-        } else {
-            try peer.request(params, 1, &.{});
-        }
-        try peer.flush();
-        _ = try conn.dispatchTimeout(1000);
-        try conn.flush();
-        var requests: [32]u8 = undefined;
-        const n = (try sys.readNonBlock(sockets[1], &requests)) orelse return error.MissingCleanup;
-        try t.expectEqual(@as(usize, if (created) 16 else 8), n);
-        if (created) {
-            try t.expectEqual(wire.server_id_start, std.mem.readInt(u32, requests[0..4], .little));
-            try t.expectEqual(params, std.mem.readInt(u32, requests[8..12], .little));
-        } else {
-            try t.expectEqual(params, std.mem.readInt(u32, requests[0..4], .little));
-        }
-    }
+test "modifier choice: linear first, never implicit" {
+    var out: [8]u64 = undefined;
+    const tiled: u64 = 0x0200_0000_1234_5678;
+    try std.testing.expectEqualSlices(u64, &.{mod_linear}, chooseModifiers(&.{ tiled, mod_linear }, true, &out));
+    try std.testing.expectEqualSlices(u64, &.{ tiled, mod_linear }, chooseModifiers(&.{ tiled, mod_invalid, mod_linear }, false, &out));
+    try std.testing.expectEqual(0, chooseModifiers(&.{mod_invalid}, true, &out).len);
+}
+
+test "dev_t split and shm format mapping" {
+    // makedev(226, 128) = 0xe280
+    try std.testing.expectEqual(226, devMajor(0xe280));
+    try std.testing.expectEqual(128, devMinor(0xe280));
+    try std.testing.expectEqual(0xe280, parseDevice(&std.mem.toBytes(@as(u64, 0xe280))).?);
+    try std.testing.expectEqual(null, parseDevice(&.{ 1, 2, 3 }));
+    try std.testing.expectEqual(P.WlShm.Format.xrgb8888, shmFormat(format_xrgb8888));
+    try std.testing.expectEqual(P.WlShm.Format.argb8888, shmFormat(format_argb8888));
+    try std.testing.expectEqual(P.WlShm.Format.xbgr8888, shmFormat(format_xbgr8888));
 }

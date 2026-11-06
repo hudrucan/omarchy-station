@@ -91,12 +91,12 @@ workspaces. Applications that require a larger minimum size keep their top-left
 corner reachable. Tiled and fullscreen windows follow Hyprland's layout. Growing
 the display does not restore earlier window sizes.
 
-Desktop capture uses linear DMA-BUF buffers when supported by the compositor and
-GPU, with shared-memory fallback. AVC420 updates can import these buffers directly
-into VA-API, including partial updates when all changes to the H.264 source fit
-inside their selected macroblocks. Other mixed updates and refinement preserve
-the previous source outside those blocks. Text and UI keep their existing codec
-policy. Use `--no-dmabuf` to force shared-memory capture when troubleshooting.
+Desktop capture uses DMA-BUF and Vulkan when supported, with shared-memory
+fallback. Changes are detected on the GPU, and eligible H.264 updates write their
+selected blocks directly into the encoder's NV12 surfaces. Other updates read
+back the pixels they need. Use `--no-gpu-capture` to force shared-memory capture.
+H.264 uses VA-API when available, with optional OpenH264 software fallback;
+`--h264-encoder auto|vaapi|software` selects the backend.
 
 The native plugin is compiled against the installed Hyprland headers and build
 ID. Its package hook rebuilds it after Hyprland upgrades. Log in again after an

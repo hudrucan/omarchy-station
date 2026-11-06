@@ -508,7 +508,7 @@ fn benchH264(b: *Bench) !void {
     var aux: std.ArrayList(u8) = .empty;
     defer aux.deinit(gpa);
     {
-        var enc = vaapi_h264.Encoder.init(gpa, .{ .width = b.w, .height = b.h, .crop = b.w % 2 == 0 and b.h % 2 == 0, .rate_control = .cqp, .qp = 26 }) catch |err| {
+        var enc = vaapi_h264.Encoder.init(gpa, .{ .width = b.w, .height = b.h, .rate_control = .cqp, .qp = 26 }) catch |err| {
             try b.addf("AVC420: no encoder ({t})", .{err}, 0, 0, 1);
             return;
         };

@@ -7,7 +7,6 @@ const c = @import("c");
 const bs = @import("h264_bitstream.zig");
 const va = @import("h264_va.zig");
 const avc444 = @import("avc444.zig");
-const dmabuf = @import("../core/dmabuf.zig");
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.h264);
@@ -118,12 +117,10 @@ pub const Encoder = struct {
     view_derived: [2]bool = .{ false, false },
     scratch: []u8 = &.{},
     coded_buf: c.VABufferID = c.VA_INVALID_ID,
-    dma_surfaces: [2]DmaSurface = .{ .{}, .{} },
-    dma_next: usize = 0,
-    dma_imports: u64 = 0,
-    dma_cache_hits: u64 = 0,
 
     bitrate: u32,
+    /// Unique per encoder (a resize makes a new one): GPU writers cache their imports by it.
+    instance: u64 = 0,
     rc_dirty: bool = true,
     need_idr: bool = true,
     frames_since_idr: u32 = 0,
@@ -133,18 +130,6 @@ pub const Encoder = struct {
     /// Parameter sets of the stream as emitted by the driver.
     params: bs.ParamSets = .{},
     hdr: std.ArrayList(u8) = .empty,
-
-    const DmaSurface = struct {
-        frame: ?dmabuf.Frame = null,
-        surface: c.VASurfaceID = c.VA_INVALID_ID,
-        fd: c_int = -1,
-
-        fn deinit(s: *DmaSurface, dpy: c.VADisplay) void {
-            if (s.surface != c.VA_INVALID_ID) _ = c.vaDestroySurfaces(dpy, &s.surface, 1);
-            if (s.fd >= 0) _ = c.close(s.fd);
-            s.* = .{};
-        }
-    };
 
     const src_surface = 0;
     const nv12_surface = 1;
@@ -216,10 +201,12 @@ pub const Encoder = struct {
 
     fn fresh(gpa: Allocator, opts: Options, geo: bs.Geometry, dev: Device) Encoder {
         const fd = dev.fd;
+        const instance = next_instance.fetchAdd(1, .monotonic);
         const dpy = dev.dpy;
         const peak = peakBitrate(opts, opts.bitrate);
         const level = bs.chooseLevel(geo, opts.fps * picturesPerFrame(opts), peak, opts.profile);
         return .{
+            .instance = instance,
             .gpa = gpa,
             .opts = opts,
             .geo = geo,
@@ -340,65 +327,93 @@ pub const Encoder = struct {
         return info;
     }
 
-    /// Cache the two capture allocations. Unknown identities remain one-shot imports.
-    pub fn encodeDmaBuf(self: *Encoder, buffer: dmabuf.Frame, force_idr: bool, out: *std.ArrayList(u8)) Error!FrameInfo {
-        if (self.opts.avc444 != null or buffer.fd < 0 or
-            buffer.width < (self.opts.width + 15) & ~@as(u32, 15) or
-            buffer.height < (self.opts.height + 15) & ~@as(u32, 15) or
-            @as(u64, buffer.stride) < @as(u64, buffer.width) * 4 or
-            @as(u64, buffer.size) < @as(u64, buffer.stride) * buffer.height) return error.BadInput;
-        if (buffer.id == 0) {
-            var surface = try self.importDmaSurface(buffer);
-            defer _ = c.vaDestroySurfaces(self.dpy, &surface, 1);
-            return self.encodeSurface(surface, force_idr, out);
-        }
-        for (&self.dma_surfaces) |*entry| if (entry.frame) |key| {
-            if (std.meta.eql(key, buffer)) {
-                self.dma_cache_hits += 1;
-                return self.encodeSurface(entry.surface, force_idr, out);
-            }
-        };
-        const owned_fd = c.fcntl(buffer.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 0));
-        if (owned_fd < 0) return error.Vaapi;
-        var owned = buffer;
-        owned.fd = owned_fd;
-        const surface = self.importDmaSurface(owned) catch |err| {
-            _ = c.close(owned_fd);
-            return err;
-        };
-        const entry = &self.dma_surfaces[self.dma_next];
-        entry.deinit(self.dpy);
-        entry.* = .{ .frame = buffer, .surface = surface, .fd = owned_fd };
-        self.dma_next = (self.dma_next + 1) % self.dma_surfaces.len;
-        return self.encodeSurface(surface, force_idr, out);
+    /// An NV12 input surface (AVC420: `.main`; AVC444: the view) as a dmabuf a GPU writes in
+    /// place: the driver encodes only surfaces it allocated. Both planes are in one object; the
+    /// caller owns `fd`.
+    pub const InputSurface = struct {
+        fd: c_int,
+        size: u32,
+        modifier: u64,
+        width: u32,
+        height: u32,
+        offsets: [2]u32,
+        pitches: [2]u32,
+    };
+
+    /// The DRM device (dev_t) that encodes: a GPU writing the input surfaces must be it.
+    pub fn drmDevice(self: *const Encoder) ?u64 {
+        var st: c.struct_stat = undefined;
+        if (c.fstat(self.fd, &st) != 0) return null;
+        return @intCast(st.st_rdev);
     }
 
-    fn importDmaSurface(self: *Encoder, buffer: dmabuf.Frame) Error!c.VASurfaceID {
+    pub fn exportInput(self: *Encoder, view: View) Error!InputSurface {
+        const surf = self.surfaces[if (view == .main) nv12_surface else aux_surface];
+        if (surf == c.VA_INVALID_SURFACE) return error.BadInput;
         var desc = std.mem.zeroes(c.VADRMPRIMESurfaceDescriptor);
-        desc.fourcc = if (buffer.format == dmabuf.xrgb8888) c.VA_FOURCC_BGRX else if (buffer.format == dmabuf.argb8888) c.VA_FOURCC_BGRA else return error.BadInput;
-        desc.width = buffer.width;
-        desc.height = buffer.height;
-        desc.num_objects = 1;
-        desc.objects[0].fd = buffer.fd;
-        desc.objects[0].size = buffer.size;
-        desc.objects[0].drm_format_modifier = 0;
-        desc.num_layers = 1;
-        desc.layers[0].drm_format = buffer.format;
-        desc.layers[0].num_planes = 1;
-        desc.layers[0].pitch[0] = buffer.stride;
-        var attrs = [_]c.VASurfaceAttrib{
-            .{ .type = c.VASurfaceAttribMemoryType, .flags = c.VA_SURFACE_ATTRIB_SETTABLE, .value = .{ .type = c.VAGenericValueTypeInteger, .value = .{ .i = c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 } } },
-            .{ .type = c.VASurfaceAttribExternalBufferDescriptor, .flags = c.VA_SURFACE_ATTRIB_SETTABLE, .value = .{ .type = c.VAGenericValueTypePointer, .value = .{ .p = &desc } } },
+        try vaCheck(c.vaExportSurfaceHandle(self.dpy, surf, c.VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2, c.VA_EXPORT_SURFACE_READ_WRITE | c.VA_EXPORT_SURFACE_COMPOSED_LAYERS, &desc), "vaExportSurfaceHandle");
+        const l = &desc.layers[0];
+        const nv12: u32 = 0x3231564E; // DRM_FORMAT_NV12
+        if (desc.num_objects != 1 or desc.num_layers != 1 or l.num_planes != 2 or l.drm_format != nv12 or l.object_index[0] != 0 or l.object_index[1] != 0) {
+            for (desc.objects[0..@min(desc.num_objects, desc.objects.len)]) |o| _ = c.close(o.fd);
+            return unsupported("a one-object NV12 surface export");
+        }
+        return .{
+            .fd = desc.objects[0].fd,
+            .size = desc.objects[0].size,
+            .modifier = desc.objects[0].drm_format_modifier,
+            .width = desc.width,
+            .height = desc.height,
+            .offsets = .{ l.offset[0], l.offset[1] },
+            .pitches = .{ l.pitch[0], l.pitch[1] },
         };
-        var surface: c.VASurfaceID = c.VA_INVALID_ID;
-        try vaCheck(c.vaCreateSurfaces(self.dpy, c.VA_RT_FORMAT_RGB32, buffer.width, buffer.height, &surface, 1, &attrs, attrs.len), "vaCreateSurfaces(DMA-BUF)");
-        self.dma_imports += 1;
-        return surface;
+    }
+
+    /// Reads input surface `view` back as NV12 (`y`: width x height, `uv` interleaved at half
+    /// size, rows packed): checks that a GPU wrote what the CPU path would.
+    pub fn readInput(self: *Encoder, view: View, w: u32, h: u32, y: []u8, uv: []u8) Error!void {
+        const surf = self.surfaces[if (view == .main) nv12_surface else aux_surface];
+        try vaCheck(c.vaSyncSurface(self.dpy, surf), "vaSyncSurface(read)");
+        var fmt: c.VAImageFormat = .{ .fourcc = c.VA_FOURCC_NV12, .byte_order = c.VA_LSB_FIRST, .bits_per_pixel = 12 };
+        var img: c.VAImage = undefined;
+        try vaCheck(c.vaCreateImage(self.dpy, &fmt, @intCast(w), @intCast(h), &img), "vaCreateImage(read)");
+        defer _ = c.vaDestroyImage(self.dpy, img.image_id);
+        try vaCheck(c.vaGetImage(self.dpy, surf, 0, 0, w, h, img.image_id), "vaGetImage");
+        var p: ?*anyopaque = null;
+        try vaCheck(c.vaMapBuffer(self.dpy, img.buf, &p), "vaMapBuffer(read)");
+        defer _ = c.vaUnmapBuffer(self.dpy, img.buf);
+        const base: [*]const u8 = @ptrCast(p orelse return error.Vaapi);
+        for (0..h) |r| @memcpy(y[r * w ..][0..w], base[img.offsets[0] + r * img.pitches[0] ..][0..w]);
+        const cw = (w + 1) / 2 * 2;
+        for (0..(h + 1) / 2) |r| @memcpy(uv[r * cw ..][0..cw], base[img.offsets[1] + r * img.pitches[1] ..][0..cw]);
+    }
+
+    /// AVC420 from the NV12 input surface as a GPU wrote it (`exportInput`): no upload, no
+    /// conversion. The writer's work must be complete (its fence waited for).
+    pub fn encodeWritten(self: *Encoder, force_idr: bool, out: *std.ArrayList(u8)) Error!FrameInfo {
+        if (self.opts.avc444 != null) return error.BadInput;
+        const t0 = nowNs();
+        var info = try self.codePicture(self.surfaces[nv12_surface], null, self.idrDue(force_idr), .main, out);
+        info.encode_ns = nowNs() - t0;
+        info.total_ns = info.encode_ns;
+        return info;
     }
 
     /// Codes the views `lc` asks for (MS-RDPEGFX 2.2.4.5), each into its own list. An IDR
     /// codes both views whatever `lc` says. On error nothing is appended.
     pub fn encode444(self: *Encoder, pixels: []const u8, stride: usize, force_idr: bool, lc: avc444.Lc, main_out: *std.ArrayList(u8), aux_out: *std.ArrayList(u8)) Error!Avc444Info {
+        return self.code444(.{ .pixels = pixels, .stride = stride }, force_idr, lc, main_out, aux_out);
+    }
+
+    /// `encode444` from the views' input surfaces as a GPU wrote them (`exportInput`, both views
+    /// whatever `lc`): no conversion, no upload. The writer's work must be complete.
+    pub fn encode444Written(self: *Encoder, force_idr: bool, lc: avc444.Lc, main_out: *std.ArrayList(u8), aux_out: *std.ArrayList(u8)) Error!Avc444Info {
+        return self.code444(null, force_idr, lc, main_out, aux_out);
+    }
+
+    const Pixels = struct { pixels: []const u8, stride: usize };
+
+    fn code444(self: *Encoder, px: ?Pixels, force_idr: bool, lc: avc444.Lc, main_out: *std.ArrayList(u8), aux_out: *std.ArrayList(u8)) Error!Avc444Info {
         const version = self.opts.avc444 orelse return error.BadInput;
         const t0 = nowNs();
         const idr = self.idrDue(force_idr);
@@ -411,7 +426,7 @@ pub const Encoder = struct {
             main_out.shrinkRetainingCapacity(main_start);
             aux_out.shrinkRetainingCapacity(aux_start);
         }
-        try self.uploadViews(version, pixels, stride, do_main, do_aux);
+        if (px) |p| try self.uploadViews(version, p.pixels, p.stride, do_main, do_aux);
         const t1 = nowNs();
         var info: Avc444Info = .{ .main = null, .aux = null };
         if (do_main) info.main = try self.codePicture(self.surfaces[nv12_surface], null, idr, .main, main_out);
@@ -470,13 +485,16 @@ pub const Encoder = struct {
 
         var bufs = BufList{ .dpy = self.dpy, .ctx = self.enc_ctx, .optional_processing = fused != null };
         defer bufs.destroy();
-        var region = self.pictureRegion();
-        var additional = [1]c.VASurfaceID{input};
 
+        // Read by the driver in vaRenderPicture, below.
+        const region = self.inputRegion();
+        var additional = [1]c.VASurfaceID{input};
         if (fused) |src| {
             var pp = pipelineParams(src);
-            pp.surface_region = &region;
-            pp.output_region = &region;
+            if (region) |*r| {
+                pp.surface_region = r;
+                pp.output_region = r;
+            }
             pp.additional_outputs = &additional;
             pp.num_additional_outputs = 1;
             try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
@@ -617,7 +635,6 @@ pub const Encoder = struct {
                     buffer_sync = false;
                     continue;
                 }
-                // Older drivers retain their original blocking synchronization path.
                 st = c.vaSyncSurface(self.dpy, target);
             }
             if (st == c.VA_STATUS_ERROR_TIMEDOUT and nowNs() < deadline) continue;
@@ -683,8 +700,18 @@ pub const Encoder = struct {
         if (attrs[0].value & c.VA_RT_FORMAT_YUV420 == 0) return unsupported("4:2:0 encode");
         if (attrs[1].value == c.VA_ATTRIB_NOT_SUPPORTED or attrs[1].value & rc_mode == 0) return unsupported("rate control mode");
         if (attrs[2].value == c.VA_ATTRIB_NOT_SUPPORTED or attrs[2].value & packed_needed != packed_needed) return unsupported("packed SPS/PPS/slice headers");
-        if (attrs[3].value != c.VA_ATTRIB_NOT_SUPPORTED and e.geo.codedWidth() > attrs[3].value) return unsupported("width");
-        if (attrs[4].value != c.VA_ATTRIB_NOT_SUPPORTED and e.geo.codedHeight() > attrs[4].value) return unsupported("height");
+        const wide = attrs[3].value != c.VA_ATTRIB_NOT_SUPPORTED and e.geo.codedWidth() > attrs[3].value;
+        if (wide or (attrs[4].value != c.VA_ATTRIB_NOT_SUPPORTED and e.geo.codedHeight() > attrs[4].value)) {
+            // An expected fallback (a desktop wider than 4096 on radeonsi): logged once per size.
+            const size = @as(u64, e.opts.width) << 32 | e.opts.height;
+            if (too_large_logged.swap(size, .monotonic) != size) {
+                const side = if (wide) "wide" else "high";
+                const coded = if (wide) e.geo.codedWidth() else e.geo.codedHeight();
+                const max = if (wide) attrs[3].value else attrs[4].value;
+                log.info("{s} ({s}): no VA-API H.264 at {d}x{d}: its encoder takes pictures up to {d} pixels {s}, this one is {d} (coded)", .{ e.node, e.vendor, e.opts.width, e.opts.height, max, side, coded });
+            }
+            return error.Unsupported;
+        }
 
         var cfg_attrs = [_]c.VAConfigAttrib{
             .{ .type = c.VAConfigAttribRTFormat, .value = c.VA_RT_FORMAT_YUV420 },
@@ -696,10 +723,13 @@ pub const Encoder = struct {
         const w = e.opts.width;
         const h = e.opts.height;
         const views = e.opts.avc444 != null;
-        // AVC444 views are written whole: their surfaces have the coded size.
-        const nw = if (views) e.geo.codedWidth() else w;
-        const nh = if (views) e.geo.codedHeight() else h;
-        if (!views) try createSurfaces(e.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, w, h, e.surfaces[src_surface..][0..1]);
+        // AVC444 views are written whole: their surfaces have the coded size. So has AVC420's
+        // input at an odd size (`paddedInput`).
+        const nw = if (views or e.paddedInput()) e.geo.codedWidth() else w;
+        const nh = if (views or e.paddedInput()) e.geo.codedHeight() else h;
+        const rw = (w + 1) & ~@as(u32, 1);
+        const rh = (h + 1) & ~@as(u32, 1);
+        if (!views) try createSurfaces(e.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, rw, rh, e.surfaces[src_surface..][0..1]);
         const inputs: usize = if (views) 2 else 1;
         try createSurfaces(e.dpy, c.VA_RT_FORMAT_YUV420, c.VA_FOURCC_NV12, nw, nh, e.surfaces[nv12_surface..][0..inputs]);
         try createSurfaces(e.dpy, c.VA_RT_FORMAT_YUV420, c.VA_FOURCC_NV12, nw, nh, e.surfaces[recon_base..][0..e.reconCount()]);
@@ -711,7 +741,7 @@ pub const Encoder = struct {
         if (!views and e.opts.conversion == .vpp) {
             if (!e.hasEntrypoint(c.VAProfileNone, c.VAEntrypointVideoProc)) return unsupported("video processing");
             try vaCheck(c.vaCreateConfig(e.dpy, c.VAProfileNone, c.VAEntrypointVideoProc, null, 0, &e.vpp_config), "vaCreateConfig(vpp)");
-            try vaCheck(c.vaCreateContext(e.dpy, e.vpp_config, @intCast(w), @intCast(h), c.VA_PROGRESSIVE, &e.surfaces[nv12_surface], 1, &e.vpp_ctx), "vaCreateContext(vpp)");
+            try vaCheck(c.vaCreateContext(e.dpy, e.vpp_config, @intCast(rw), @intCast(rh), c.VA_PROGRESSIVE, &e.surfaces[nv12_surface], 1, &e.vpp_ctx), "vaCreateContext(vpp)");
         }
 
         // Worst case: 3200 bits per macroblock (A.3.1) plus headers.
@@ -739,12 +769,11 @@ pub const Encoder = struct {
             e.image_derived = true;
         } else {
             var fmt: c.VAImageFormat = .{ .fourcc = c.VA_FOURCC_BGRX, .byte_order = c.VA_LSB_FIRST, .bits_per_pixel = 32 };
-            try vaCheck(c.vaCreateImage(e.dpy, &fmt, @intCast(w), @intCast(h), &e.image), "vaCreateImage");
+            try vaCheck(c.vaCreateImage(e.dpy, &fmt, @intCast(rw), @intCast(rh), &e.image), "vaCreateImage");
         }
     }
 
     fn releaseVa(e: *Encoder) void {
-        e.clearDmaCache();
         if (e.image.image_id != c.VA_INVALID_ID) _ = c.vaDestroyImage(e.dpy, e.image.image_id);
         e.image.image_id = c.VA_INVALID_ID;
         for (&e.view_images) |*img| {
@@ -769,11 +798,6 @@ pub const Encoder = struct {
         }
     }
 
-    pub fn clearDmaCache(e: *Encoder) void {
-        for (&e.dma_surfaces) |*entry| entry.deinit(e.dpy);
-        e.dma_next = 0;
-    }
-
     fn hasEntrypoint(e: *Encoder, profile: c.VAProfile, entrypoint: c.VAEntrypoint) bool {
         return dpyHasEntrypoint(e.dpy, profile, entrypoint);
     }
@@ -795,9 +819,17 @@ pub const Encoder = struct {
         } else {
             for (0..h) |y| @memcpy(base[y * pitch ..][0..row], pixels[y * stride ..][0..row]);
         }
+        const rw = (w + 1) & ~@as(u32, 1);
+        const rh = (h + 1) & ~@as(u32, 1);
+        // NV12 rectangles are even-sized. Replicate the last RGB pixel/row so
+        // drivers can convert 1:1 without rounding an odd rectangle and scaling.
+        if (w % 2 != 0) for (0..h) |y| {
+            @memcpy(base[y * pitch + row ..][0..4], base[y * pitch + row - 4 ..][0..4]);
+        };
+        if (h % 2 != 0) @memcpy(base[h * pitch ..][0 .. rw * 4], base[(h - 1) * pitch ..][0 .. rw * 4]);
         try vaCheck(c.vaUnmapBuffer(self.dpy, self.image.buf), "vaUnmapBuffer(image)");
         if (!self.image_derived) {
-            try vaCheck(c.vaPutImage(self.dpy, self.surfaces[src_surface], self.image.image_id, 0, 0, w, h, 0, 0, w, h), "vaPutImage");
+            try vaCheck(c.vaPutImage(self.dpy, self.surfaces[src_surface], self.image.image_id, 0, 0, rw, rh, 0, 0, rw, rh), "vaPutImage");
         }
     }
 
@@ -877,25 +909,38 @@ pub const Encoder = struct {
         };
     }
 
+    /// AVC420 at an odd size: the NV12 input has the coded size, as a GPU writes NV12 only into
+    /// an image of even sides (gpu/nv12.zig, GPU capture), and the picture is its top left. Even
+    /// sizes keep the picture's size (the encoder pads them itself).
+    fn paddedInput(self: *const Encoder) bool {
+        return self.opts.avc444 == null and (self.opts.width % 2 != 0 or self.opts.height % 2 != 0);
+    }
+
+    /// The picture plus one replicated edge if odd: NV12's rectangle must be even.
+    fn inputRegion(self: *const Encoder) ?c.VARectangle {
+        if (!self.paddedInput()) return null;
+        return .{ .x = 0, .y = 0, .width = @intCast((self.opts.width + 1) & ~@as(u32, 1)), .height = @intCast((self.opts.height + 1) & ~@as(u32, 1)) };
+    }
+
     /// BGRX surface -> NV12 surface.
     fn convert(self: *Encoder, src: c.VASurfaceID) Error!void {
         var bufs = BufList{ .dpy = self.dpy, .ctx = self.vpp_ctx };
         defer bufs.destroy();
-        var region = self.pictureRegion();
         var pp = pipelineParams(src);
-        // Imported allocations are 16-aligned; scale only the logical picture, not its padding.
-        pp.surface_region = &region;
-        pp.output_region = &region;
+        // Read by the driver in vaRenderPicture.
+        const region = self.inputRegion();
+        if (region) |*r| {
+            // Exclude coded-size padding on both sides; otherwise VPP scales it
+            // into the logical picture, shifting pixels around moving windows.
+            pp.surface_region = r;
+            pp.output_region = r;
+        }
         try bufs.add(c.VAProcPipelineParameterBufferType, std.mem.asBytes(&pp));
         try vaCheck(c.vaBeginPicture(self.dpy, self.vpp_ctx, self.surfaces[nv12_surface]), "vaBeginPicture(vpp)");
         const rs = c.vaRenderPicture(self.dpy, self.vpp_ctx, &bufs.ids, @intCast(bufs.n));
         const es = c.vaEndPicture(self.dpy, self.vpp_ctx);
         try vaCheck(rs, "vaRenderPicture(vpp)");
         try vaCheck(es, "vaEndPicture(vpp)");
-    }
-
-    fn pictureRegion(self: *const Encoder) c.VARectangle {
-        return .{ .x = 0, .y = 0, .width = @intCast(self.opts.width), .height = @intCast(self.opts.height) };
     }
 
     /// Full-range BT.709 matrix only (MS-RDPEGFX 3.3.8.3.1), no transfer-function conversion.
@@ -1065,6 +1110,8 @@ fn createSurfaces(dpy: c.VADisplay, rt_format: c_int, fourcc: c_int, w: u32, h: 
     try vaCheck(c.vaCreateSurfaces(dpy, @intCast(rt_format), w, h, out.ptr, @intCast(out.len), &attr, attr.len), "vaCreateSurfaces");
 }
 
+var next_instance = std.atomic.Value(u64).init(1);
+
 fn vaCheck(st: c.VAStatus, what: []const u8) Error!void {
     if (st == c.VA_STATUS_SUCCESS) return;
     log.err("{s}: {s} (0x{x})", .{ what, std.mem.span(c.vaErrorStr(st)), st });
@@ -1120,6 +1167,9 @@ fn dpyHasEntrypoint(dpy: c.VADisplay, profile: c.VAProfile, entrypoint: c.VAEntr
     for (eps[0..@intCast(@min(n, eps.len))]) |x| if (x == entrypoint) return true;
     return false;
 }
+
+/// The size last found too large for the encoder (logged once per size).
+var too_large_logged = std.atomic.Value(u64).init(0);
 
 /// `opts.device`, or else the first render node whose driver encodes H.264 `opts.profile`:
 /// on a hybrid laptop renderD128 is often the dGPU, whose driver only decodes, and the
@@ -1205,76 +1255,11 @@ fn fillTestFrame(buf: []u8, w: u32, h: u32, frame: u32) void {
     };
 }
 
-fn readTestNv12(e: *Encoder) ![]u8 {
-    try vaCheck(c.vaSyncSurface(e.dpy, e.surfaces[Encoder.nv12_surface]), "vaSyncSurface(test)");
-    var img: c.VAImage = undefined;
-    if (c.vaDeriveImage(e.dpy, e.surfaces[Encoder.nv12_surface], &img) != c.VA_STATUS_SUCCESS) return error.SkipZigTest;
-    defer _ = c.vaDestroyImage(e.dpy, img.image_id);
-    if (img.format.fourcc != c.VA_FOURCC_NV12) return error.SkipZigTest;
-    var ptr: ?*anyopaque = null;
-    try vaCheck(c.vaMapBuffer(e.dpy, img.buf, &ptr), "vaMapBuffer(test)");
-    defer _ = c.vaUnmapBuffer(e.dpy, img.buf);
-    const base: [*]const u8 = @ptrCast(ptr orelse return error.Vaapi);
-    const w: usize = e.opts.width;
-    const h: usize = e.opts.height;
-    // Compare all visible luma and the chroma blocks wholly inside an odd-sized picture.
-    const uv_width = w & ~@as(usize, 1);
-    const result = try e.gpa.alloc(u8, w * h + uv_width * (h / 2));
-    for (0..h) |y| @memcpy(result[y * w ..][0..w], base[img.offsets[0] + y * img.pitches[0] ..][0..w]);
-    for (0..h / 2) |y| @memcpy(result[w * h + y * uv_width ..][0..uv_width], base[img.offsets[1] + y * img.pitches[1] ..][0..uv_width]);
-    return result;
-}
-
-test "GPU: padded RGB imports preserve logical pixel coordinates" {
-    if (!haveGpu()) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    for ([_][2]u32{ .{ 978, 644 }, .{ 1000, 641 } }) |size| {
-        const w = size[0];
-        const h = size[1];
-        const pw = (w + 15) & ~@as(u32, 15);
-        const ph = (h + 15) & ~@as(u32, 15);
-        var enc = try Encoder.init(gpa, .{ .width = w, .height = h, .crop = false, .rate_control = .cqp });
-        defer enc.deinit();
-        const pixels = try gpa.alloc(u8, w * h * 4);
-        defer gpa.free(pixels);
-        fillTestFrame(pixels, w, h, 3);
-        try enc.upload(pixels, w * 4);
-        try enc.convert(enc.surfaces[Encoder.src_surface]);
-        const expected = try readTestNv12(&enc);
-        defer gpa.free(expected);
-
-        var padded: [1]c.VASurfaceID = undefined;
-        try createSurfaces(enc.dpy, c.VA_RT_FORMAT_RGB32, c.VA_FOURCC_BGRX, pw, ph, &padded);
-        defer _ = c.vaDestroySurfaces(enc.dpy, &padded, 1);
-        var fmt: c.VAImageFormat = .{ .fourcc = c.VA_FOURCC_BGRX, .byte_order = c.VA_LSB_FIRST, .bits_per_pixel = 32 };
-        var img: c.VAImage = undefined;
-        try vaCheck(c.vaCreateImage(enc.dpy, &fmt, @intCast(pw), @intCast(ph), &img), "vaCreateImage(padded test)");
-        defer _ = c.vaDestroyImage(enc.dpy, img.image_id);
-        var ptr: ?*anyopaque = null;
-        try vaCheck(c.vaMapBuffer(enc.dpy, img.buf, &ptr), "vaMapBuffer(padded test)");
-        const base: [*]u8 = @ptrCast(ptr orelse return error.Vaapi);
-        for (0..ph) |y| {
-            @memset(base[img.offsets[0] + y * img.pitches[0] ..][0 .. pw * 4], 0xff);
-            if (y < h) @memcpy(base[img.offsets[0] + y * img.pitches[0] ..][0 .. w * 4], pixels[y * w * 4 ..][0 .. w * 4]);
-        }
-        try vaCheck(c.vaUnmapBuffer(enc.dpy, img.buf), "vaUnmapBuffer(padded test)");
-        try vaCheck(c.vaPutImage(enc.dpy, padded[0], img.image_id, 0, 0, pw, ph, 0, 0, pw, ph), "vaPutImage(padded test)");
-        try enc.convert(padded[0]);
-        const actual = try readTestNv12(&enc);
-        defer gpa.free(actual);
-        var changed: usize = 0;
-        for (expected, actual) |a, b| changed += @intFromBool(a != b);
-        if (changed != 0) std.debug.print("VPP {d}x{d} from padded {d}x{d}: {d}/{d} bytes changed\n", .{ w, h, pw, ph, changed, expected.len });
-        try testing.expectEqual(@as(usize, 0), changed);
-    }
-}
-
 test "GPU: bounded waits service their owner while preserving valid access units" {
     if (!haveGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const Owner = struct {
         calls: usize = 0,
-
         fn service(ctx: *anyopaque) void {
             const owner: *@This() = @ptrCast(@alignCast(ctx));
             owner.calls += 1;
@@ -1288,7 +1273,6 @@ test "GPU: bounded waits service their owner while preserving valid access units
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     var params: bs.ParamSets = .{};
-    owner.calls = 0;
     for (0..4) |i| {
         fillTestFrame(pixels, 978, 644, @intCast(i));
         out.clearRetainingCapacity();
@@ -1400,6 +1384,48 @@ test "GPU: odd-macroblock size, IDR on demand, cropping, one picture per AU" {
             try testing.expectEqual(@as(?i32, 0), pps.second_chroma_qp_index_offset);
         }
         try testing.expect(fi.size > 0 and fi.size == out.items.len);
+    }
+}
+
+test "GPU: AVC420 at odd sizes: coded-size input, the picture converted into its top left unscaled" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_][2]u32{ .{ 1001, 777 }, .{ 333, 211 }, .{ 1000, 777 } }) |size| {
+        const w = size[0];
+        const h = size[1];
+        var enc = Encoder.init(gpa, .{ .width = w, .height = h, .crop = false, .rate_control = .cqp, .conversion = .vpp, .verify = true }) catch |err| switch (err) {
+            error.Unsupported, error.VaInit, error.OpenDevice => return error.SkipZigTest,
+            else => return err,
+        };
+        defer enc.deinit();
+        const in = try enc.exportInput(.main);
+        _ = c.close(in.fd);
+        try testing.expectEqual(enc.geo.codedWidth(), in.width);
+        try testing.expectEqual(enc.geo.codedHeight(), in.height);
+        // A one-pixel checkerboard, grey: any scaling or shift shows at full contrast.
+        const px = try gpa.alloc(u8, @as(usize, w) * h * 4);
+        defer gpa.free(px);
+        for (0..h) |y| for (0..w) |x| {
+            const v: u8 = if ((x + y) % 2 == 0) 0 else 255;
+            px[(y * w + x) * 4 ..][0..4].* = .{ v, v, v, 0 };
+        };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        const fi = try enc.encode(px, @as(usize, w) * 4, false, &out);
+        try testing.expect(fi.idr and fi.size > 0);
+        const cw = (w + 1) / 2 * 2;
+        const y = try gpa.alloc(u8, @as(usize, w) * h);
+        defer gpa.free(y);
+        const uv = try gpa.alloc(u8, @as(usize, cw) * ((h + 1) / 2));
+        defer gpa.free(uv);
+        try enc.readInput(.main, w, h, y, uv);
+        var off: usize = 0;
+        for (0..h) |yy| for (0..w) |x| {
+            const want: i32 = if ((x + yy) % 2 == 0) 0 else 255;
+            if (@abs(@as(i32, y[yy * w + x]) - want) > 3) off += 1;
+        };
+        try testing.expectEqual(0, off);
+        for (uv) |v| try testing.expect(@abs(@as(i32, v) - 128) <= 3);
     }
 }
 
