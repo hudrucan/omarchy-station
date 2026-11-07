@@ -131,7 +131,6 @@ pub fn build(b: *std.Build) void {
         "install-omarchy",
         "plugin/build.sh",
         "packaging/omastation/PKGBUILD",
-        "packaging/hyprland/PKGBUILD",
         "packaging/omastation/install-login",
         "packaging/omastation/omastation-session-start",
         "packaging/omastation/omastation-session-launch",

@@ -180,6 +180,12 @@ pub const Desktop = struct {
     cursor_hot_seen: [multimon.max_monitors]u32 = @splat(0),
     /// The plugin lacks `hyprctl omastation-cursor`; asked again next session.
     cursor_info_missing: bool = false,
+    cursor_plugin_available: bool = false,
+    cursor_plugin_active: bool = false,
+    cursor_native_works: bool = false,
+    cursor_plugin_after_ms: i64 = 0,
+    cursor_plugin_hash: ?u64 = null,
+    cursor_plugin_serial: u32 = 0,
     cursor: cursor_mod.Tracker,
     /// The cursor went into or out of the frames: the captures must restart.
     captures_stale: bool = false,
@@ -1691,6 +1697,7 @@ pub const Desktop = struct {
             if (d.cursor.paintForGood("client-drawn pointers need omastation's Hyprland plugin (it keeps the cursor out of RDP outputs' frames)", .{})) d.captures_stale = true;
             return;
         }
+        d.cursor_plugin_available = plugin.cursorImagesAvailable(&d.ipc, d.gpa);
         d.refreshCursorLook();
         d.cursor_info_missing = false;
         for (0..d.plan.count) |i| d.startCursorAt(i);
@@ -1736,21 +1743,26 @@ pub const Desktop = struct {
     fn pollCursors(d: *Desktop) Error!void {
         if (d.cursor.mode != .paint) for (0..d.plan.count) |i| {
             const cur = d.cursors[i] orelse continue;
-            switch (cur.image_capture.state) {
-                .stopped, .failed => {
-                    // Hyprland stops a cursor capture started while the cursor is hidden; a new one gets the image.
-                    if (cur.image_capture.state == .stopped and !d.cursor.works and d.cursor_restarts[i] < max_cursor_probes) {
-                        d.cursor_restarts[i] += 1;
-                        log.info("{s}: the cursor capture stopped before its first image (started while the cursor was hidden?): opened again", .{d.plan.outputs[i].name()});
-                        d.startCursorAt(i);
-                        continue;
-                    }
+            const image_ended = cur.image_capture.state == .stopped or cur.image_capture.state == .failed;
+            if (image_ended) {
+                // Hyprland stops a cursor capture started while the cursor is hidden; a new one gets the image.
+                if (cur.image_capture.state == .stopped and !d.cursor.works and d.cursor_restarts[i] < max_cursor_probes) {
+                    d.cursor_restarts[i] += 1;
+                    log.info("{s}: the cursor capture stopped before its first image (started while the cursor was hidden?): opened again", .{d.plan.outputs[i].name()});
+                    d.startCursorAt(i);
+                    continue;
+                }
+                d.cursor_native_works = false;
+                if (d.cursor_plugin_available) {
+                    // Keep the parent cursor session: position events still track server warps
+                    // even when its separate image capture stopped and pixels come from IPC.
+                    d.cursor_plugin_active = true;
+                } else {
                     log.warn("{s}: the cursor capture ended ({t})", .{ d.plan.outputs[i].name(), cur.image_capture.state });
                     if (!d.cursor.works and d.cursor.paintForGood("the cursor capture ended", .{})) d.captures_stale = true;
                     d.stopCursorAt(i);
                     continue;
-                },
-                else => {},
+                }
             }
             if (cur.position_serial != d.cursor_seen[i]) {
                 d.cursor_seen[i] = cur.position_serial;
@@ -1766,6 +1778,7 @@ pub const Desktop = struct {
                     }
                 }
             }
+            if (image_ended) continue;
             const img = (try cur.takeImage()) orelse {
                 if (cur.inside and cur.hotspot_serial != d.cursor_hot_seen[i]) {
                     d.cursor_hot_seen[i] = cur.hotspot_serial;
@@ -1789,16 +1802,26 @@ pub const Desktop = struct {
             d.cursor_hot_seen[i] = cur.hotspot_serial;
             const info = d.cursorInfo();
             const hot = d.cursorHotspot(cur, img.frame.width, img.frame.height, info);
-            if (try d.cursor.onImage(.{
+            const serial = d.cursor.shape_serial;
+            const captured: cursor_mod.Captured = .{
                 .width = img.frame.width,
                 .height = img.frame.height,
                 .stride = img.frame.stride,
                 .pixels = img.frame.data,
                 .hot_x = hot[0],
                 .hot_y = hot[1],
-            }, shownOf(info), nowMs())) d.captures_stale = true;
+            };
+            // Broken Wayland captures must not hide a pointer the snapshot owns.
+            // Snapshot polling handles visibility until a real capture image returns.
+            if (d.cursor_plugin_active and cursor_mod.emptyCapture(captured)) continue;
+            if (try d.cursor.onImage(captured, shownOf(info), nowMs())) d.captures_stale = true;
+            if (d.cursor.shape_serial != serial and !d.cursor.hidden and !d.cursor.fallback) {
+                d.cursor_native_works = true;
+                d.cursor_plugin_active = false;
+            }
             if (!d.cursor.judged) d.cursor_missed[i] = true;
         };
+        try d.pollPluginCursor();
         if (d.cursor.suspect_since_ms) |since| if (nowMs() - since >= cursor_mod.fallback_after_ms) {
             if (d.cursor.confirmFallback(nowMs(), shownOf(d.cursorInfo()))) d.captures_stale = true;
         };
@@ -1806,6 +1829,49 @@ pub const Desktop = struct {
             d.captures_stale = false;
             log.info("the cursor is {s} from now on", .{if (d.cursor.painting) "painted into the frames" else "drawn by the client"});
             for (0..d.plan.count) |i| if (d.captureAt(i) != null) try d.restartCapture(i);
+        }
+    }
+
+    fn pollPluginCursor(d: *Desktop) Error!void {
+        if (!d.cursor_plugin_available or d.cursor.mode == .paint) return;
+        if (d.cursor_native_works and !d.cursor_plugin_active and !d.cursor.confirming() and !d.cursor.fallback) return;
+        const now = nowMs();
+        if (now < d.cursor_plugin_after_ms) return;
+        // At most 20 queries/s while capture is broken; normal idle polling is slower.
+        d.cursor_plugin_after_ms = now + 50;
+        const known = if (d.cursor_plugin_active and !d.cursor.hidden and !d.cursor.painting and d.cursor.shape_serial == d.cursor_plugin_serial)
+            d.cursor_plugin_hash
+        else
+            null;
+        const snapshot = plugin.cursorSnapshot(&d.ipc, d.gpa, known) orelse {
+            d.cursor_plugin_after_ms = now + 500;
+            return;
+        };
+        defer snapshot.deinit(d.gpa);
+        switch (snapshot) {
+            .hidden => {
+                d.cursor_plugin_active = true;
+                d.cursor.onHidden();
+            },
+            .unavailable => {
+                d.cursor_plugin_active = true;
+                if (d.cursor.snapshotUnavailable()) d.captures_stale = true;
+            },
+            .same => {},
+            .image => |im| {
+                if (!d.cursor_plugin_active) log.info("using the plugin's CPU cursor snapshots: no patched compositor needed", .{});
+                d.cursor_plugin_active = true;
+                if (try d.cursor.onSnapshot(.{
+                    .width = im.width,
+                    .height = im.height,
+                    .stride = @as(usize, im.width) * 4,
+                    .pixels = im.pixels,
+                    .hot_x = im.hot_x,
+                    .hot_y = im.hot_y,
+                })) d.captures_stale = true;
+                d.cursor_plugin_hash = im.hash;
+                d.cursor_plugin_serial = d.cursor.shape_serial;
+            },
         }
     }
 

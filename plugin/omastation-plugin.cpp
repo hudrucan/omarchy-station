@@ -3,7 +3,7 @@
 //    of its RDP outputs, and stay hidden in every other capture;
 // 2. absolute pointer motion moves the hardware cursor;
 // 3. RDP outputs' own frames leave out the software cursor (the client draws it);
-// 4. `hyprctl omastation-cursor` reports the cursor image's scale, hotspot and visibility;
+// 4. cursor IPC reports scale, hotspot, visibility and bounded CPU bitmap snapshots;
 // 5. capturing a window whose monitor is gone fails instead of crashing Hyprland;
 // 6. so does a capture request (output frame, cursor frame) reaching it after its output went.
 // It only loads into the Hyprland build it was compiled for; a hook that cannot
@@ -19,6 +19,7 @@
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/core/Seat.hpp>
 #include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/desktop/view/WLSurface.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
@@ -34,6 +35,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <cstdlib>
 #include <cstring>
@@ -428,6 +430,92 @@ static constexpr const char* RDP_CURSOR_MARKER = "[rdp-frames-without-cursor]";
 namespace CursorInfo {
 
     static SP<SHyprCtlCommand> g_command;
+    static SP<SHyprCtlCommand> g_imageCommand;
+
+    // Bounded CPU-only fallback for compositors with broken cursor capture.
+    // No renderer state, GPU readback, or new hooks are involved.
+    static constexpr size_t MAX_IMAGE_SIDE = 256;
+
+    static std::string imageReply(const uint8_t* data, size_t stride, size_t w, size_t h, int hx, int hy, bool swapRB, std::string_view known) {
+        if (!data || !w || !h || w > MAX_IMAGE_SIDE || h > MAX_IMAGE_SIDE || stride < w * 4)
+            return "unavailable";
+        const auto header = std::format("v1 {} {} {} {} ", w, h, hx, hy);
+        uint64_t hash = 14695981039346656037ULL;
+        bool visible = false;
+        const auto add = [&hash](uint8_t b) { hash = (hash ^ b) * 1099511628211ULL; };
+        for (const unsigned char c : header)
+            add(c);
+        for (size_t y = 0; y < h; ++y)
+            for (size_t x = 0; x < w; ++x)
+                for (size_t c = 0; c < 4; ++c) {
+                    const auto b = data[y * stride + x * 4 + (swapRB && c != 1 && c != 3 ? 2 - c : c)];
+                    add(b);
+                    visible |= c == 3 && b != 0;
+                }
+        if (!visible)
+            return "hidden";
+        const auto digest = std::format("{:016x}", hash);
+        if (known == digest)
+            return header + digest + " same";
+        std::string reply = header + digest + " ";
+        reply.reserve(reply.size() + w * h * 8);
+        static constexpr char HEX[] = "0123456789abcdef";
+        for (size_t y = 0; y < h; ++y) {
+            for (size_t x = 0; x < w; ++x) {
+                for (size_t c = 0; c < 4; ++c) {
+                    const auto b = data[y * stride + x * 4 + (swapRB && c != 1 && c != 3 ? 2 - c : c)];
+                    reply += HEX[b >> 4];
+                    reply += HEX[b & 15];
+                }
+            }
+        }
+        return reply;
+    }
+
+    static std::string imageAnswer(eHyprCtlOutputFormat, std::string request) {
+        try {
+            const auto& image = Pointer::mgr()->currentCursorImage();
+            if (!g_pHyprRenderer->shouldRenderCursor())
+                return "hidden";
+            if (!std::isfinite(image.size.x) || !std::isfinite(image.size.y) || image.size.x < 1 || image.size.y < 1 ||
+                image.size.x > MAX_IMAGE_SIDE || image.size.y > MAX_IMAGE_SIDE || !std::isfinite(image.hotspot.x) || !std::isfinite(image.hotspot.y) ||
+                !std::isfinite(image.scale) || image.scale <= 0 || image.scale > 16)
+                return "unavailable";
+            const size_t w = sc<size_t>(image.size.x), h = sc<size_t>(image.size.y);
+            const int hx = sc<int>(std::clamp(std::round(image.hotspot.x * image.scale), 0.0, sc<double>(w - 1)));
+            const int hy = sc<int>(std::clamp(std::round(image.hotspot.y * image.scale), 0.0, sc<double>(h - 1)));
+            const auto space = request.find(' ');
+            const std::string_view known = space == std::string::npos ? std::string_view{} : std::string_view{request}.substr(space + 1);
+            if (image.pBuffer) {
+                const auto shm = image.pBuffer->shm();
+                if (!shm.success || (shm.format != DRM_FORMAT_ARGB8888 && shm.format != DRM_FORMAT_ABGR8888) || shm.size.x != w || shm.size.y != h ||
+                    shm.stride < w * 4)
+                    return "unavailable";
+                auto [data, format, len] = image.pBuffer->beginDataPtr(0);
+                struct EndRead {
+                    SP<Aquamarine::IBuffer> buffer;
+                    ~EndRead() { buffer->endDataPtr(); }
+                } read{image.pBuffer};
+                // Theme buffers report one row as length, though the mapping holds all rows.
+                if (len < w * 4 || format != shm.format)
+                    return "unavailable";
+                return imageReply(data, shm.stride, w, h, hx, hy, shm.format == DRM_FORMAT_ABGR8888, known);
+            }
+            const auto surface = image.surface.lock();
+            const auto res = surface ? surface->resource() : nullptr;
+            if (!res || !res->m_current.texture || !res->m_current.texture->m_isSynchronous || !res->m_role || res->m_role->role() != SURFACE_ROLE_CURSOR ||
+                res->m_current.bufferSize.x != w || res->m_current.bufferSize.y != h || res->m_current.transform != WL_OUTPUT_TRANSFORM_NORMAL ||
+                res->m_current.viewport.hasSource || res->m_current.viewport.hasDestination)
+                return "unavailable";
+            const auto format = res->m_current.texture->m_drmFormat;
+            if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_ABGR8888)
+                return "unavailable";
+            const auto& pixels = CCursorSurfaceRole::cursorPixelData(res);
+            if (pixels.size() % h != 0 || pixels.size() / h < w * 4)
+                return "unavailable";
+            return imageReply(pixels.data(), pixels.size() / h, w, h, hx, hy, format == DRM_FORMAT_ABGR8888, known);
+        } catch (...) { return "unavailable"; }
+    }
 
     // Any non-transparent pixel in a 32 bpp image with alpha in the high byte.
     static bool anyAlpha(const uint8_t* data, size_t stride, size_t w, size_t h) {
@@ -602,6 +690,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     } catch (...) { CursorInfo::g_command = nullptr; }
     if (!CursorInfo::g_command)
         Log::logger->log(Log::ERR, "[omastation] cannot register `hyprctl omastation-cursor`: RDP pointer hotspots are estimated");
+    try {
+        CursorInfo::g_imageCommand = HyprlandAPI::registerHyprCtlCommand(g_handle, SHyprCtlCommand{.name = "omastation-cursor-image", .exact = false, .fn = CursorInfo::imageAnswer});
+    } catch (...) { CursorInfo::g_imageCommand = nullptr; }
 
     Log::logger->log(Log::INFO,
                      "[omastation] loaded for Hyprland build {}: protected windows {}, absolute motion cursor fix {}, RDP frames without the cursor {}, "
@@ -612,6 +703,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     std::string description = "protected windows for omastation's capture of its outputs; absolute motion moves the hardware cursor";
     if (SoftwareCursor::g_render)
         description += std::string{"; RDP outputs' frames without the cursor "} + RDP_CURSOR_MARKER;
+    if (SoftwareCursor::g_render && CursorInfo::g_imageCommand)
+        description += " [rdp-cursor-image-v1]";
     return {"omastation", description, "omastation", "1"};
 }
 

@@ -4,8 +4,4 @@ packaging/omastation/omastation/
 packaging/omastation/src/
 packaging/omastation/pkg/
 packaging/omastation/*.pkg.tar.zst
-packaging/hyprland/src/
-packaging/hyprland/pkg/
-packaging/hyprland/*.pkg.tar.zst
-packaging/hyprland/Hyprland-*.tar.gz
 dist/

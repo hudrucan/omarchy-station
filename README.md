@@ -128,7 +128,7 @@ ID. Its package hook rebuilds it after Hyprland upgrades. Log in again after an
 upgrade so the running compositor matches the installed files.
 
 <details>
-<summary><strong>Graphics pipeline and optional compositor patches</strong></summary>
+<summary><strong>Graphics pipeline and cursor handling</strong></summary>
 
 Desktop capture uses DMA-BUF and Vulkan when supported, with shared-memory
 fallback. Changes are detected on the GPU. Eligible H.264 updates write selected
@@ -136,18 +136,15 @@ blocks directly into the encoder's NV12 surfaces; other updates read back the
 pixels they need. VA-API supports AVC420/AVC444, while OpenH264 software encoding
 supports AVC420. The client must negotiate the corresponding codec.
 
-The separate patched Hyprland package includes cursor-image capture fixes and
-capture-lifecycle fixes for removed outputs. Without the cursor fix, Omastation
-can paint the pointer into desktop frames.
+Client-drawn cursors do not require a patched Hyprland. When Wayland cursor
+capture returns empty images, the native plugin can supply the actual cursor
+bitmap from CPU memory. Snapshots are bounded to 256×256 pixels and unchanged
+images are cached. GPU-only cursor surfaces fall back to painting the pointer
+into desktop frames, with a transparent client pointer to avoid double cursors.
 
-```sh
-make hyprland-package MAKEPKG_FLAGS=--install
-```
-
-This replaces the installed compositor with the version in
-`packaging/hyprland/PKGBUILD`. Log out and back in afterwards. A later Arch
-Hyprland upgrade can replace these patches. Building or updating Omastation
-does not apply these compositor patches.
+Omastation uses the distribution's Hyprland package. Its native plugin handles
+the cursor fallback and guards capture requests against removed outputs; there
+is no separate compositor build or patch installation step.
 
 </details>
 

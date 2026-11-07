@@ -379,12 +379,105 @@ pub fn framesWithoutCursor(ipc: *const hypr.Ipc, gpa: std.mem.Allocator) bool {
 }
 
 pub fn parseFramesWithoutCursor(arena: std.mem.Allocator, json: []const u8) bool {
+    return hasMarker(arena, json, rdp_cursor_marker);
+}
+
+fn hasMarker(arena: std.mem.Allocator, json: []const u8, marker: []const u8) bool {
     const P = struct { name: []const u8 = "", description: []const u8 = "" };
     const list = std.json.parseFromSliceLeaky([]const P, arena, json, .{ .ignore_unknown_fields = true }) catch return false;
     for (list) |p| {
-        if (std.mem.eql(u8, p.name, "omastation") and std.mem.indexOf(u8, p.description, rdp_cursor_marker) != null) return true;
+        if (std.mem.eql(u8, p.name, "omastation") and std.mem.indexOf(u8, p.description, marker) != null) return true;
     }
     return false;
+}
+
+pub fn cursorImagesAvailable(ipc: *const hypr.Ipc, gpa: std.mem.Allocator) bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const reply = ipc.request(arena.allocator(), "j/plugin list") catch return false;
+    return hasMarker(arena.allocator(), reply, "[rdp-cursor-image-v1]");
+}
+
+pub const cursor_image_max_side = 256;
+
+/// CPU snapshot of the actual theme or application's cursor; pixels are BGRA.
+pub const CursorSnapshot = union(enum) {
+    hidden,
+    unavailable,
+    same,
+    image: struct { width: u16, height: u16, hot_x: u16, hot_y: u16, hash: u64, pixels: []u8 },
+
+    pub fn deinit(s: CursorSnapshot, gpa: std.mem.Allocator) void {
+        if (s == .image) gpa.free(s.image.pixels);
+    }
+};
+
+pub fn cursorSnapshot(ipc: *const hypr.Ipc, gpa: std.mem.Allocator, known: ?u64) ?CursorSnapshot {
+    // Cursor fallback must not stall input behind a busy compositor's IPC.
+    var fast = ipc.*;
+    fast.timeout_ms = 25;
+    var buf: [80]u8 = undefined;
+    const cmd = if (known) |hash|
+        std.fmt.bufPrint(&buf, "j/omastation-cursor-image {x:0>16}", .{hash}) catch unreachable
+    else
+        "j/omastation-cursor-image";
+    const reply = fast.request(gpa, cmd) catch return null;
+    defer gpa.free(reply);
+    return parseCursorSnapshot(gpa, reply, known);
+}
+
+pub fn parseCursorSnapshot(gpa: std.mem.Allocator, reply: []const u8, known: ?u64) ?CursorSnapshot {
+    const text = std.mem.trim(u8, reply, " \r\n");
+    if (std.mem.eql(u8, text, "hidden")) return .hidden;
+    if (std.mem.eql(u8, text, "unavailable")) return .unavailable;
+    var it = std.mem.tokenizeAny(u8, text, " \r\n");
+    if (!std.mem.eql(u8, it.next() orelse return null, "v1")) return null;
+    const w = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const h = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const hx = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const hy = std.fmt.parseInt(u16, it.next() orelse return null, 10) catch return null;
+    const digest = it.next() orelse return null;
+    if (w == 0 or h == 0 or w > cursor_image_max_side or h > cursor_image_max_side or hx >= w or hy >= h or digest.len != 16) return null;
+    const hash = std.fmt.parseInt(u64, digest, 16) catch return null;
+    const data = it.next() orelse return null;
+    if (it.next() != null) return null;
+    if (std.mem.eql(u8, data, "same")) {
+        if (known == null or known.? != hash) return null;
+        return .same;
+    }
+    const size = @as(usize, w) * h * 4;
+    if (data.len != size * 2) return null;
+    const pixels = gpa.alloc(u8, size) catch return null;
+    _ = std.fmt.hexToBytes(pixels, data) catch {
+        gpa.free(pixels);
+        return null;
+    };
+    return .{ .image = .{ .width = w, .height = h, .hot_x = hx, .hot_y = hy, .hash = hash, .pixels = pixels } };
+}
+
+test "cursor snapshot: bounded BGRA shape, matching cache token, hidden and unsupported" {
+    const a = std.testing.allocator;
+    const s = parseCursorSnapshot(a, "v1 2 1 1 0 000000000000000a 112233ff00000000\n", null).?;
+    defer s.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33, 0xff, 0, 0, 0, 0 }, s.image.pixels);
+    try std.testing.expectEqual(@as(u16, 1), s.image.hot_x);
+    try std.testing.expectEqual(@as(u64, 10), s.image.hash);
+    try std.testing.expect(parseCursorSnapshot(a, "v1 2 1 1 0 000000000000000a same", 10).? == .same);
+    try std.testing.expect(parseCursorSnapshot(a, "v1 2 1 1 0 000000000000000a same", null) == null);
+    try std.testing.expect(parseCursorSnapshot(a, "v1 2 1 1 0 000000000000000a same", 11) == null);
+    try std.testing.expect(parseCursorSnapshot(a, "hidden", null).? == .hidden);
+    try std.testing.expect(parseCursorSnapshot(a, "unavailable", null).? == .unavailable);
+    for ([_][]const u8{
+        "unknown request",
+        "v2 1 1 0 0 0000000000000001 00000000",
+        "v1 0 1 0 0 0000000000000001 00000000",
+        "v1 257 1 0 0 0000000000000001 same",
+        "v1 1 1 1 0 0000000000000001 00000000",
+        "v1 1 1 -1 0 0000000000000001 00000000",
+        "v1 1 1 0 0 0000000000000001 000000",
+        "v1 1 1 0 0 0000000000000001 000000gg",
+        "v1 1 1 0 0 0000000000000001 00000000 extra",
+    }) |bad| try std.testing.expect(parseCursorSnapshot(a, bad, null) == null);
 }
 
 test "framesWithoutCursor reads the plugin description" {

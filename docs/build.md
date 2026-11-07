@@ -40,14 +40,15 @@ VA-API drivers for your GPU to use hardware acceleration.
 | `make bench` | Run the short CPU benchmark; set `BENCH_ARGS` for a longer run |
 | `make test-capture` | Run the upstream DMA-BUF capture benchmark on an isolated `BASE` output |
 | `make test-window-fit` | Exercise floating-window recovery in a temporary nested compositor |
+| `make test-cursor` | Check theme/app cursor snapshots and visibility on an isolated compositor |
 | `make package` | Snapshot the working tree and build an Arch package |
 | `make install` | Build the package and install it through makepkg/pacman |
-| `make hyprland-package` | Build the separate patched compositor package |
 | `make clean` | Remove development build outputs and the local Zig cache |
 
 The native plugin is rebuilt when its target is requested so changes to installed
 Hyprland headers and its build ID cannot leave a stale plugin. Normal server
-builds do not compile the plugin or Hyprland itself.
+builds do not compile the plugin. Hyprland itself is supplied by the distribution;
+Omastation does not build or replace it.
 
 The checks use fake desktop-start commands and a fake compositor where applicable.
 They do not enable units, change login settings or establish a real remote desktop
@@ -72,6 +73,11 @@ an inactive workspace, application minimum sizes, and preservation of windows
 that already fit or belong to another monitor. It also checks that growing the
 display does not enlarge windows. It needs Hyprland, Quickshell and one running
 Hyprland instance for the nested renderer; it does not resize the live desktop.
+
+`make test-cursor` builds the plugin and loads it only into a temporary nested
+Hyprland. It verifies actual theme and Wayland application cursor pixels, shape
+changes, cached snapshots, hiding and recovery without a compositor patch. It
+has the same Hyprland/Quickshell requirements and does not reload the live plugin.
 
 
 For fewer parallel jobs or another build location:
@@ -116,13 +122,3 @@ Package names use the version from `build.zig.zon` and `pkgrel` from `PKGBUILD`.
 Repeated development builds replace the same package filename; retain a copy
 elsewhere if you need that exact build for rollback. Do not run two package builds
 against the same source/build directories concurrently.
-
-The optional patched Hyprland build has its own makepkg tree. It honours `JOBS`
-through `CMAKE_BUILD_PARALLEL_LEVEL` and is requested explicitly:
-
-```sh
-make hyprland-package JOBS=2
-```
-
-Add `MAKEPKG_FLAGS=--install` to install it, or `MAKEPKG_FLAGS=--log` to retain
-build logs. Neither normal server builds nor package updates rebuild Hyprland.

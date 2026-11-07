@@ -60,7 +60,7 @@ pub const fallback_after_ms: i64 = 250;
 pub const Tracker = struct {
     gpa: std.mem.Allocator,
     mode: Mode,
-    /// A non-transparent image arrived: the capture works.
+    /// A real image arrived from capture or the plugin fallback.
     works: bool = false,
     /// An image arrived while the cursor was over its output.
     judged: bool = false,
@@ -102,6 +102,25 @@ pub const Tracker = struct {
         t.image = null;
     }
 
+    /// The plugin cannot snapshot this cursor (for example a GPU-only surface).
+    /// Auto may paint temporarily and can return to client drawing on a later image.
+    pub fn snapshotUnavailable(t: *Tracker) bool {
+        if (t.mode != .auto or t.painting) return false;
+        t.painting = true;
+        t.fallback = true;
+        t.suspect_since_ms = null;
+        return true;
+    }
+
+    pub fn onHidden(t: *Tracker) void {
+        t.judged = true;
+        t.suspect_since_ms = null;
+        if (!t.hidden) {
+            t.hidden = true;
+            t.shape_serial +%= 1;
+        }
+    }
+
     /// The client cannot draw the pointer. True when `painting` changed.
     pub fn paintForGood(t: *Tracker, comptime why: []const u8, args: anytype) bool {
         if (t.mode == .paint) return false;
@@ -128,6 +147,15 @@ pub const Tracker = struct {
             .empty => return t.onEmpty(img, shown, now_ms),
             .shape => {},
         }
+        return t.accept(img, "Wayland capture");
+    }
+
+    /// A bounded CPU snapshot is authoritative; an opaque black cursor is valid here.
+    pub fn onSnapshot(t: *Tracker, img: Captured) std.mem.Allocator.Error!bool {
+        return t.accept(img, "plugin snapshot");
+    }
+
+    fn accept(t: *Tracker, img: Captured, comptime source: []const u8) std.mem.Allocator.Error!bool {
         t.judged = true;
         t.suspect_since_ms = null;
         try t.store(img);
@@ -135,7 +163,7 @@ pub const Tracker = struct {
         t.shape_serial +%= 1;
         if (!t.works) {
             t.works = true;
-            log.info("the compositor's cursor capture works: the client draws the pointer", .{});
+            log.info("a cursor image is available ({s}): the client draws the pointer", .{source});
         }
         if (t.fallback) log.debug("the cursor capture gives the cursor again: drawn by the client", .{});
         t.fallback = false;
@@ -311,6 +339,11 @@ pub const Tracker = struct {
 
 const Class = enum { empty, black, shape };
 
+/// Capture buffers are validated by the Wayland reader before reaching the tracker.
+pub fn emptyCapture(img: Captured) bool {
+    return classify(img) == .empty;
+}
+
 fn classify(img: Captured) Class {
     var all_zero = true;
     var all_black = true;
@@ -335,6 +368,29 @@ fn hashOf(w: u16, h: u16, hx: u16, hy: u16, look: ptr.Look, pixels: []const u8, 
 }
 
 const testing = std.testing;
+
+test "plugin snapshot recovers client drawing without a compositor patch, including an opaque black cursor" {
+    var t = Tracker.init(testing.allocator, .auto);
+    defer t.deinit();
+    const black = solid(4, .{ 0, 0, 0, 255 });
+    // The Wayland bug's black/outside-output sentinel is not authoritative.
+    try testing.expect(!try t.onImage(cap(4, &black), .unknown, 0));
+    try testing.expect(t.painting and !t.works);
+    // The plugin reads the real pixels, so even an all-black shape is valid.
+    try testing.expect(try t.onSnapshot(cap(4, &black)));
+    try testing.expect(!t.painting and t.works and !t.hidden);
+    const serial = t.shape_serial;
+    t.onHidden();
+    try testing.expect(t.hidden and t.shape_serial != serial);
+    const hidden_serial = t.shape_serial;
+    t.onHidden();
+    try testing.expectEqual(hidden_serial, t.shape_serial);
+    try testing.expect(t.snapshotUnavailable());
+    try testing.expect(t.painting and t.fallback and t.mode == .auto);
+    try testing.expect(!t.snapshotUnavailable());
+    try testing.expect(try t.onSnapshot(cap(4, &black)));
+    try testing.expect(!t.painting and !t.fallback and !t.hidden);
+}
 
 fn solid(comptime n: usize, px: [4]u8) [n * n * 4]u8 {
     var out: [n * n * 4]u8 = undefined;

@@ -128,6 +128,13 @@ pub fn pump(c: *Conn, t: *const cursor_mod.Tracker) conn_mod.Error!void {
         st.warp_serial = t.warp_serial;
         if (st.shown != .hidden) {
             try c.queueUpdate(.ptr_null, &.{});
+            // Some clients retain a local cursor after NULL, especially on focus changes.
+            // A real transparent shape also works on colour-only clients.
+            if (t.painting) {
+                var pixels: [transparent_side * transparent_side * 4]u8 = @splat(0);
+                const image = transparentImage(&pixels);
+                try sendShape(c, &image);
+            }
             st.shown = .hidden;
             st.shape_serial = t.shape_serial;
             st.sent_hidden += 1;
@@ -154,6 +161,21 @@ pub fn pump(c: *Conn, t: *const cursor_mod.Tracker) conn_mod.Error!void {
         queued = true;
     }
     if (queued) try c.flush();
+}
+
+const transparent_side = 32;
+
+fn transparentImage(pixels: *[transparent_side * transparent_side * 4]u8) cursor_mod.Image {
+    return .{
+        .width = transparent_side,
+        .height = transparent_side,
+        .stride = transparent_side * 4,
+        .pixels = pixels,
+        .hot_x = 0,
+        .hot_y = 0,
+        .look = .normal,
+        .hash = std.hash.Wyhash.hash(0x6879_7072_6470, pixels),
+    };
 }
 
 fn clamp16(v: i32) u16 {
@@ -214,6 +236,26 @@ fn sendShape(c: *Conn, img: *const cursor_mod.Image) conn_mod.Error!void {
 }
 
 const testing = std.testing;
+
+test "paint fallback uses a transparent pointer on alpha and colour-only clients" {
+    var pixels: [transparent_side * transparent_side * 4]u8 = @splat(0);
+    const image = transparentImage(&pixels);
+    for ([_]u16{ 24, 32 }) |bpp| {
+        var shape = try ptr.encode(testing.allocator, .{
+            .width = image.width,
+            .height = image.height,
+            .stride = image.stride,
+            .pixels = image.pixels,
+            .hot_x = image.hot_x,
+            .hot_y = image.hot_y,
+            .look = image.look,
+        }, bpp);
+        defer shape.deinit(testing.allocator);
+        // AND 1 + black XOR is transparent, with zero alpha in the 32-bit case.
+        try testing.expect(std.mem.allEqual(u8, shape.xor_mask, 0));
+        try testing.expect(std.mem.allEqual(u8, shape.and_mask, 255));
+    }
+}
 
 test "Caps: cache of the smaller side, colour pointers without pointerCacheSize" {
     var cc: caps.ClientCaps = .{ .pointer_cache_size = 21, .large_pointer_flags = 3, .multifragment_max_request_size = 0x9482B };

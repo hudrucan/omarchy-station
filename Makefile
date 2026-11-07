@@ -21,7 +21,7 @@ ZIG_BUILD_FLAGS = --cache-dir "$(ZIG_LOCAL_CACHE_DIR)" \
 PACKAGE_ENV = BUILDDIR="$(BUILDDIR)" SRCDEST="$(SRCDEST)" \
 	PKGDEST="$(PKGDEST)" LOGDEST="$(LOGDEST)"
 
-.PHONY: all build plugin check bench test-capture test-window-fit package install hyprland-package clean
+.PHONY: all build plugin check bench test-capture test-window-fit test-cursor package install clean
 
 all: build
 
@@ -43,6 +43,9 @@ test-capture:
 test-window-fit:
 	ZIG="$(ZIG)" OPTIMIZE="$(OPTIMIZE)" JOBS="$(JOBS)" python3 tests/window_fit.py
 
+test-cursor: plugin
+	OMASTATION_PLUGIN="$(BUILD_DIR)/out/lib/omastation-plugin.so" python3 tests/cursor_snapshot.py
+
 # Snapshot the working tree, including uncommitted source, without build artifacts.
 package:
 	mkdir -p "$(BUILDDIR)" "$(SRCDEST)" "$(PKGDEST)" "$(LOGDEST)"
@@ -53,12 +56,6 @@ package:
 
 install:
 	$(MAKE) package MAKEPKG_FLAGS="$(MAKEPKG_FLAGS) --install"
-
-# The patched compositor is independent of server and plugin development.
-hyprland-package:
-	mkdir -p "$(BUILDDIR)" "$(SRCDEST)" "$(PKGDEST)" "$(LOGDEST)"
-	env $(PACKAGE_ENV) CMAKE_BUILD_PARALLEL_LEVEL="$(JOBS)" \
-		makepkg --dir packaging/hyprland --force $(MAKEPKG_FLAGS)
 
 # Keep the shared toolchain, global Zig cache, makepkg work trees and packages.
 clean:
