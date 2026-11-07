@@ -9,7 +9,7 @@ system files; it never downloads or installs a compiler.
 ## Dependencies
 
 On Omarchy, `./install-omarchy` installs dependencies and the built package. To
-prepare a development machine without installing Omastation:
+prepare a development machine without installing Omarchy Station:
 
 ```sh
 omarchy pkg add \
@@ -48,12 +48,19 @@ VA-API drivers for your GPU to use hardware acceleration.
 The native plugin is rebuilt when its target is requested so changes to installed
 Hyprland headers and its build ID cannot leave a stale plugin. Normal server
 builds do not compile the plugin. Hyprland itself is supplied by the distribution;
-Omastation does not build or replace it.
+Omarchy Station does not build or replace it.
 
 The checks use fake desktop-start commands and a fake compositor where applicable.
 They do not enable units, change login settings or establish a real remote desktop
 session. A successful check is not a live client compatibility or display-isolation
 test.
+
+The [GitHub Actions workflow](../.github/workflows/ci.yml) runs on pushes to
+`main`, pull requests and manual dispatch. It uses the pinned Zig toolchain for
+formatting checks, checks shell syntax and runs the Python desktop-start
+contract tests. CI does not compile the server/plugin or run benchmarks; run
+`make check` locally before submitting code. GPU capture, window-fit and cursor
+tests remain separate because they need a compositor session.
 
 The graphics log counts input events serviced during bounded VA-API waits.
 Graphics/control PDUs remain ordered with input. GPU capture and masked NV12

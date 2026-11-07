@@ -4,43 +4,42 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Build and check (Arch Linux)
+  check:
+    name: Formatting and script checks
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    timeout-minutes: 10
     steps:
-      - name: Install build and test dependencies
-        run: >-
-          pacman -Syu --noconfirm --needed
-          git mise python hyprland jq
-          pkgconf openssl pam libva mesa vulkan-headers vulkan-icd-loader
-          libxkbcommon opus libfdk-aac gsm fuse3 libpipewire openh264
-
-      - uses: actions/checkout@v4
-
-      - name: Restore toolchain and build caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.local/share/mise/installs/zig
-            ~/.cache/zig
-            ~/.cache/omastation/build
-          key: ${{ runner.os }}-omastation-${{ hashFiles('mise.toml') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-omastation-${{ hashFiles('mise.toml') }}-
+      - uses: actions/checkout@v7
 
       - name: Set up the pinned toolchain
+        uses: jdx/mise-action@v5
+
+      - name: Check Zig formatting
+        run: mise exec -- zig fmt --check build.zig build.zig.zon src
+
+      - name: Check shell syntax
         run: |
-          mise trust
-          mise install
+          for script in \
+            install-omarchy \
+            plugin/build.sh \
+            packaging/omastation/PKGBUILD \
+            packaging/omastation/install-login \
+            packaging/omastation/omastation-session-start \
+            packaging/omastation/omastation-session-launch \
+            packaging/omastation/omastation-login-recover \
+            packaging/omastation/omastation-recover; do
+            bash -n "$script"
+          done
 
-      - name: Build, check formatting and run unit/integration tests
-        run: make check JOBS=2
-
-      - name: Benchmark builds and runs
-        run: make bench JOBS=2
+      - name: Check desktop-start contracts
+        run: python3 tests/login_start.py

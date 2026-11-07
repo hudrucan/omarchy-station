@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="title description">
+  <title id="title">Omarchy Station</title>
+  <desc id="description">Your desktop, wherever you are. A desktop display and a phone share a connection. Same session, files across devices, room on any screen.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#142c28"/>
+      <stop offset="1" stop-color="#0b1716"/>
+    </linearGradient>
+    <linearGradient id="screen" x2="1" y2="1">
+      <stop stop-color="#27594c"/>
+      <stop offset="1" stop-color="#16332e"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#a6e8c6" stroke-opacity=".045"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="420" rx="24" fill="url(#background)"/>
+  <rect width="1200" height="420" rx="24" fill="url(#grid)"/>
+  <g font-family="DejaVu Sans, sans-serif">
+    <g transform="translate(56 52)">
+      <rect width="34" height="34" rx="9" fill="#a6e8c6"/>
+      <path d="M8 11h18v12H8zM13 27h8M17 23v4" fill="none" stroke="#142c28" stroke-width="2" stroke-linejoin="round"/>
+      <text x="48" y="24" fill="#a6e8c6" font-size="20" font-weight="700" letter-spacing="3">OMARCHY STATION</text>
+    </g>
+    <text x="56" y="164" fill="#f2f5ec" font-size="54" font-weight="700" letter-spacing="-2">Your desktop.</text>
+    <text x="56" y="228" fill="#a6e8c6" font-size="54" font-weight="700" letter-spacing="-2">Wherever you are.</text>
+    <text x="58" y="275" fill="#baccc3" font-size="21">Remote access to the Omarchy you already use.</text>
+    <path d="M56 315h1088" stroke="#a6e8c6" stroke-opacity=".16"/>
+    <g fill="#d9e7de" font-size="19">
+      <circle cx="64" cy="364" r="4" fill="#a6e8c6"/>
+      <text x="81" y="371">Same session</text>
+      <circle cx="379" cy="364" r="4" fill="#a6e8c6"/>
+      <text x="396" y="371">Files across devices</text>
+      <circle cx="814" cy="364" r="4" fill="#a6e8c6"/>
+      <text x="831" y="371">Room on any screen</text>
+    </g>
+  </g>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="791" y="76" width="294" height="180" rx="14" fill="#101f1d" stroke="#7ba48d" stroke-width="2"/>
+    <rect x="803" y="88" width="270" height="150" rx="6" fill="url(#screen)"/>
+    <path d="M925 256v22m-35 0h96" stroke="#7ba48d" stroke-width="3"/>
+    <path d="M835 198l63-72 37 43 37-26 66 71" stroke="#a6e8c6" stroke-width="2" opacity=".45"/>
+    <path d="M975 140h60" stroke="#d3f0d8" stroke-width="2" stroke-dasharray="3 8"/>
+    <rect x="1035" y="136" width="84" height="148" rx="15" fill="#101f1d" stroke="#b4d6bf" stroke-width="2"/>
+    <rect x="1043" y="151" width="68" height="116" rx="6" fill="url(#screen)"/>
+    <path d="M1066 144h22m-23 131h24" stroke="#b4d6bf" stroke-width="2"/>
+    <path d="M1053 243l20-41 18 15 10-9" stroke="#a6e8c6" stroke-width="2" opacity=".65"/>
+  </g>
+</svg>
