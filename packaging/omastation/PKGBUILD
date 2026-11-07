@@ -2,7 +2,7 @@ pkgname=omastation
 pkgver=0.1.6
 pkgrel=1
 pkgdesc="RDP server for your Hyprland desktop"
-url="https://github.com/hudrucan/omastation"
+url="https://github.com/hudrucan/omarchy-station"
 arch=(x86_64)
 license=(MIT)
 # gcc, pkgconf, binutils: the Hyprland plugin is rebuilt after every Hyprland update.

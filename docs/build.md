@@ -114,6 +114,11 @@ can be overridden. Keep build directories in a stable location to retain
 incremental build state. `make clean` leaves the shared toolchain/global cache,
 makepkg work trees, source archives and finished packages intact.
 
+Renaming or moving the checkout keeps these directories and the shared Zig
+installation. Package builds still extract into the same `omastation` source
+directory under makepkg. Direct development builds may recompile project units
+once because their source paths changed, then reuse the new cache entries.
+
 ## Packaging the working tree
 
 `make package` creates `omastation.tar` from the current checkout, excluding Git

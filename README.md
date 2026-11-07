@@ -1,19 +1,25 @@
 # Omarchy Station
 
-![Omarchy Station — your desktop, wherever you are.](docs/assets/station.svg)
-
 **Your desktop. Your apps. Pick up where you left off.**
 
 An RDP server for [Omarchy](https://omarchy.org/) and Hyprland. Connect from a
 Mac, laptop or phone to the desktop you already use. Keep your apps running,
 bring files across and make room when you move to a smaller screen.
 
-[![CI](https://github.com/hudrucan/omastation/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hudrucan/omastation/actions/workflows/ci.yml)
+[![CI](https://github.com/hudrucan/omarchy-station/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hudrucan/omarchy-station/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-a6e8c6)](LICENSE)
 
 [Get started](#get-started) · [Everyday use](#everyday-use) ·
 [Configure](#configure) · [Build](#development) ·
-[Report an issue](https://github.com/hudrucan/omastation/issues)
+[Report an issue](https://github.com/hudrucan/omarchy-station/issues)
+
+**Wide display to portrait. Your windows stay in reach.**
+
+[![A real RDP session with an editor and terminal. The client switches from a wide display to portrait, and both windows move back into the visible work area.](docs/assets/demo.gif)](docs/assets/demo.mp4)
+
+*Typing and a real 1280×720 → 480×760 display change over localhost RDP.
+FreeRDP on Linux, with an isolated demo project. GIF: 10 fps preview;
+[MP4](docs/assets/demo.mp4) · [Recording details](docs/assets/README.md).*
 
 The command, package and services are still named **`omastation`**. Existing
 installations keep their configuration and credentials.
@@ -32,22 +38,13 @@ installations keep their configuration and credentials.
 Uses the distribution's **stock Hyprland**. Cursor handling lives in the native
 plugin; there is no compositor patch to maintain.
 
-<details>
-<summary>Earlier RDP connection sample</summary>
-
-[Watch the sample recording](docs/assets/demo.mp4). It shows a real localhost
-RDP connection to an isolated Hyprland desktop through FreeRDP, with sample
-windows. The recording is 12 fps and is not a performance benchmark.
-
-</details>
-
 ## Get started
 
 ### 1. Install on Omarchy
 
 ```sh
-git clone https://github.com/hudrucan/omastation.git
-cd omastation
+git clone https://github.com/hudrucan/omarchy-station.git
+cd omarchy-station
 ./install-omarchy
 ```
 
@@ -213,7 +210,7 @@ commit; `make install` installs the resulting package.
 
 ## Contributing and credits
 
-[Open an issue](https://github.com/hudrucan/omastation/issues) with your Station
+[Open an issue](https://github.com/hudrucan/omarchy-station/issues) with your Station
 package version, Omarchy/Hyprland and RDP client versions, reproduction steps,
 and relevant logs with private information removed. Focused pull requests are
 welcome. Run `make check` before submitting code; display and client changes
