@@ -9,7 +9,7 @@ bring files across and make room when you move to a smaller screen.
 [![CI](https://github.com/hudrucan/omarchy-station/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hudrucan/omarchy-station/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-a6e8c6)](LICENSE)
 
-[Get started](#get-started) · [Everyday use](#everyday-use) ·
+[Why Station?](#why-omarchy-station) · [Get started](#get-started) · [Everyday use](#everyday-use) ·
 [Configure](#configure) · [Build](#development) ·
 [Report an issue](https://github.com/hudrucan/omarchy-station/issues)
 
@@ -37,6 +37,38 @@ installations keep their configuration and credentials.
 
 Uses the distribution's **stock Hyprland**. Cursor handling lives in the native
 plugin; there is no compositor patch to maintain.
+
+## Why Omarchy Station?
+
+**Leave the desk. Keep the workflow.** Station brings remote login, desktop
+takeover and window recovery together for Omarchy. Connect after a reboot with
+on-demand login configured, bring a project over from your Mac, then switch to
+a phone without leaving floating windows beyond the edge of the screen.
+
+[hypr-rdp](https://github.com/MuNeNiCK/hypr-rdp) is a capable alternative for an
+existing Hyprland session. Both projects offer hardware H.264, audio, clipboard
+sync and file/folder transfers. Station's focus is how those pieces fit into
+your everyday desktop.
+
+| For your workflow | Omarchy Station | hypr-rdp |
+| --- | --- | --- |
+| Connect before the desktop starts | Packaged on-demand login starts or reuses your desktop after authentication | Setup assumes a running Hyprland session; session hooks are available |
+| Switch from a large screen to a phone | Repositions and shrinks floating windows into the visible work area | Client-sized headless output; equivalent window recovery is not documented |
+| Bring files and folders across | Clipboard file streaming, manually tested with Finder and Windows App on macOS | Bidirectional clipboard file streaming |
+| Use AVC444 for detailed text | VA-API encoding when negotiated and supported | Experimental software encoding |
+| Maintain across Hyprland updates | Native plugin rebuilds against the installed Hyprland; no compositor patches | Wayland protocols and Hyprland IPC; no native plugin to rebuild |
+
+Choose **Station** for an integrated Omarchy workflow across desk, laptop and
+phone. Choose **hypr-rdp** for a general Hyprland server with fewer dependencies
+on compositor internals.
+
+*Compared against [hypr-rdp v0.1.8](https://github.com/MuNeNiCK/hypr-rdp/tree/v0.1.8)
+on 8 November 2026. This compares documented features and integration;
+performance has not been benchmarked head to head.*
+
+**Native RDP, end to end.** Station implements RDP in Zig and integrates with
+Hyprland through Wayland and a C++ plugin. It does not run through wayvnc or a
+VNC-to-RDP bridge. hypr-rdp is also native RDP, built in Rust on IronRDP.
 
 ## Get started
 
