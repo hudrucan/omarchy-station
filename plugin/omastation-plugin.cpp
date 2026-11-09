@@ -40,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -432,6 +433,41 @@ namespace CursorInfo {
     static SP<SHyprCtlCommand> g_command;
     static SP<SHyprCtlCommand> g_imageCommand;
 
+    struct SurfaceFormat {
+        WP<CWLSurfaceResource> surface;
+        WP<Render::ITexture> texture;
+        uint32_t format = 0;
+        size_t width = 0, height = 0, stride = 0;
+        CHyprSignalListener commit;
+    };
+    static std::vector<std::unique_ptr<SurfaceFormat>> g_surfaceFormats;
+    static CHyprSignalListener g_newSurface;
+
+    static void rememberFormat(SurfaceFormat& entry) {
+        const auto res = entry.surface.lock();
+        if (!res || !res->m_current.buffer)
+            return;
+        // commit is emitted after the CPU cursor copy, before SHM is released.
+        // Keep only metadata, with weak surface/texture identities: no client
+        // buffer or pixel storage is retained and no GPU readback is needed.
+        // A client may assign the cursor role after its first buffer commit.
+        const auto shm = res->m_current.buffer->shm();
+        entry.texture = res->m_current.texture;
+        entry.format = shm.success ? shm.format : 0;
+        entry.width = shm.success && shm.size.x > 0 ? shm.size.x : 0;
+        entry.height = shm.success && shm.size.y > 0 ? shm.size.y : 0;
+        entry.stride = shm.success ? shm.stride : 0;
+    }
+
+    static void watchSurface(SP<CWLSurfaceResource> res) {
+        std::erase_if(g_surfaceFormats, [](const auto& entry) { return !entry->surface.lock(); });
+        auto entry = std::make_unique<SurfaceFormat>();
+        entry->surface = res;
+        entry->commit = res->m_events.commit.listen([ptr = entry.get()] { rememberFormat(*ptr); });
+        rememberFormat(*entry);
+        g_surfaceFormats.push_back(std::move(entry));
+    }
+
     // Bounded CPU-only fallback for compositors with broken cursor capture.
     // No renderer state, GPU readback, or new hooks are involved.
     static constexpr size_t MAX_IMAGE_SIDE = 256;
@@ -507,13 +543,37 @@ namespace CursorInfo {
                 res->m_current.bufferSize.x != w || res->m_current.bufferSize.y != h || res->m_current.transform != WL_OUTPUT_TRANSFORM_NORMAL ||
                 res->m_current.viewport.hasSource || res->m_current.viewport.hasDestination)
                 return "unavailable";
-            const auto format = res->m_current.texture->m_drmFormat;
+            auto format = res->m_current.texture->m_drmFormat;
+            size_t stride = 0;
+            // GL texture allocation can reset m_drmFormat to zero. The committed
+            // SHM buffer still describes the CPU cursor cache's actual layout.
+            if (const auto& buffer = res->m_current.buffer; buffer) {
+                const auto shm = buffer->shm();
+                if (!shm.success || shm.size.x != w || shm.size.y != h || shm.stride < w * 4)
+                    return "unavailable";
+                format = shm.format;
+                stride = shm.stride;
+            } else {
+                std::erase_if(g_surfaceFormats, [](const auto& entry) { return !entry->surface.lock(); });
+                for (const auto& entry : g_surfaceFormats) {
+                    if (entry->surface.lock() == res && entry->texture.lock() == res->m_current.texture && entry->width == w && entry->height == h) {
+                        format = entry->format;
+                        stride = entry->stride;
+                        break;
+                    }
+                }
+            }
             if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_ABGR8888)
                 return "unavailable";
             const auto& pixels = CCursorSurfaceRole::cursorPixelData(res);
-            if (pixels.size() % h != 0 || pixels.size() / h < w * 4)
+            if (!stride) {
+                if (pixels.size() % h != 0)
+                    return "unavailable";
+                stride = pixels.size() / h;
+            }
+            if (stride < w * 4 || pixels.size() < stride * h)
                 return "unavailable";
-            return imageReply(pixels.data(), pixels.size() / h, w, h, hx, hy, format == DRM_FORMAT_ABGR8888, known);
+            return imageReply(pixels.data(), stride, w, h, hx, hy, format == DRM_FORMAT_ABGR8888, known);
         } catch (...) { return "unavailable"; }
     }
 
@@ -659,6 +719,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (const auto EXE = std::filesystem::canonical("/proc/self/exe", ec); ec || EXE.empty())
         throw std::runtime_error("omastation plugin: Hyprland's executable was replaced on disk (updated or reinstalled): log in again");
 
+    CursorInfo::g_newSurface = PROTO::compositor->m_events.newSurface.listen([](SP<CWLSurfaceResource> res) { CursorInfo::watchSurface(res); });
+    PROTO::compositor->forEachSurface([](SP<CWLSurfaceResource> res) { CursorInfo::watchSurface(res); });
+
     Protected::g_render      = hookOrSkip("Screenshare::CScreenshareFrame::render()", rc<const void*>(&Protected::hkRender), "showing protected windows to omastation");
     Protected::g_storeTempFB = hookOrSkip("Screenshare::CScreenshareFrame::storeTempFB()", rc<const void*>(&Protected::hkStoreTempFB),
                                           "showing protected windows to omastation while a permission prompt is open");
@@ -709,6 +772,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    CursorInfo::g_newSurface.reset();
+    CursorInfo::g_surfaceFormats.clear();
     // Hyprland removes the hooks itself. The capture handlers hkCursorCreateFrame set on frames
     // still pending stay: an unload with such a frame outstanding is unsafe.
 }

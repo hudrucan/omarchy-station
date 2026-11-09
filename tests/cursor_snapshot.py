@@ -2,6 +2,7 @@
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import subprocess
@@ -88,6 +89,18 @@ def change_cursor(shape):
 
 
 try:
+    protocol_dir = subprocess.check_output(
+        ['pkg-config', '--variable=pkgdatadir', 'wayland-protocols'], text=True).strip()
+    protocol = pathlib.Path(protocol_dir) / 'stable/xdg-shell/xdg-shell.xml'
+    for mode, output in [('client-header', 'xdg-shell-client-protocol.h'),
+                         ('private-code', 'xdg-shell-protocol.c')]:
+        subprocess.run(['wayland-scanner', mode, str(protocol), str(tmp / output)], check=True)
+    flags = shlex.split(subprocess.check_output(
+        ['pkg-config', '--cflags', '--libs', 'wayland-client'], text=True))
+    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-I', str(tmp),
+                    str(pathlib.Path(__file__).with_name('cursor_shm.c')),
+                    str(tmp / 'xdg-shell-protocol.c'), '-o', str(tmp / 'cursor-shm'),
+                    *flags], check=True)
     with (tmp / 'hyprland.log').open('w') as log:
         children.append(subprocess.Popen(['Hyprland', '--config', str(config)], env=env,
                                         stdout=log, stderr=log, start_new_session=True))
@@ -135,9 +148,50 @@ try:
     assert snapshot() == 'hidden', 'A transparent application cursor must remain hidden'
     change_cursor('arrow')
     assert isinstance(snapshot(), list), 'Cursor did not recover after being hidden'
-    print('Cursor snapshot integration passed: theme, Wayland shape changes, cache, hidden and recovery on stock Hyprland')
+    with (tmp / 'shm-fixture.log').open('w') as log:
+        shm_fixture = subprocess.Popen([str(tmp / 'cursor-shm')], env=env,
+            stdin=subprocess.PIPE, text=True, stdout=log, stderr=log, start_new_session=True)
+        children.append(shm_fixture)
+    for _ in range(70):
+        windows = json.loads(hypr('-j', 'clients'))
+        fixture = next((w for w in windows if w.get('title') == 'cursor-shm-fixture'), None)
+        if fixture:
+            break
+        if shm_fixture.poll() is not None:
+            raise RuntimeError('SHM cursor fixture exited')
+        time.sleep(.1)
+    else:
+        raise RuntimeError('SHM cursor fixture timed out')
+    x, y = fixture['at']
+    hypr('eval', f'hl.dispatch(hl.dsp.cursor.move({{x={x + 80},y={y + 80}}}))')
+    time.sleep(.2)
+
+    def shm_shape(shape):
+        shm_fixture.stdin.write(shape + '\n')
+        shm_fixture.stdin.flush()
+        time.sleep(.2)
+        return snapshot()
+
+    # Actual SHM textures can report DRM format zero on stock Hyprland. The
+    # original buffer's format and padded stride must produce exact BGRA pixels.
+    expected = 'aa6622ff' * (24 * 24)
+    argb = shm_shape('argb')
+    assert isinstance(argb, list), f'ARGB application cursor: {argb}'
+    assert argb[1:5] == ['24', '24', '3', '5'] and argb[6] == expected
+    assert snapshot(argb[5])[6] == 'same'
+    abgr = shm_shape('abgr')
+    assert isinstance(abgr, list) and abgr[6] == expected, 'ABGR channels or padded stride are wrong'
+    assert abgr[5] == argb[5], 'Equivalent pixels must have the same cache identity'
+    assert shm_shape('xrgb') == 'unavailable', 'Unsupported formats must keep the safe fallback'
+    assert shm_shape('hidden') == 'hidden', 'An application-hidden pointer must remain hidden'
+    assert shm_shape('argb')[6] == expected, 'SHM cursor did not recover'
+    hypr('plugin', 'unload', str(plugin))
+    hypr('plugin', 'load', str(plugin))
+    assert shm_shape('argb')[6] == expected, 'Existing surfaces were not observed after plugin reload'
+    print('Cursor snapshot integration passed: theme, Wayland shape changes, cache, hidden, '
+          'padded ARGB/ABGR application buffers, unsupported format, recovery and reload on stock Hyprland')
 except Exception:
-    for name in ['hyprland.log', 'fixture.log']:
+    for name in ['hyprland.log', 'fixture.log', 'shm-fixture.log']:
         path = tmp / name
         if path.exists():
             print(name + ':\n' + path.read_text()[-2000:])
