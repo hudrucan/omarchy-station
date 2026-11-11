@@ -290,3 +290,23 @@ test "compressor round trips through the decoder (8K and 64K)" {
         }
     }
 }
+
+test "fuzz: arbitrary bytes and flags never crash the decoder" {
+    var prng: std.Random.DefaultPrng = .init(0x6d70_7063);
+    const rand = prng.random();
+    const gpa = std.testing.allocator;
+    var buf: [4096]u8 = undefined;
+    for ([_]bool{ false, true }) |big| {
+        var d = try Decoder.init(gpa, big);
+        defer d.deinit(gpa);
+        for (0..100_000) |_| {
+            const n = rand.uintLessThan(usize, buf.len);
+            rand.bytes(buf[0..n]);
+            // Mostly compressed packets, with any mix of the front and flush flags.
+            const flags: u8 = (if (rand.uintLessThan(u8, 8) != 0) bulk.packet_compressed else 0) |
+                (if (rand.boolean()) bulk.packet_at_front else 0) |
+                (if (rand.uintLessThan(u8, 8) == 0) bulk.packet_flushed else 0);
+            _ = d.decompress(buf[0..n], flags) catch continue;
+        }
+    }
+}

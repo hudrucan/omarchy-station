@@ -449,3 +449,18 @@ pub fn encodePng(gpa: Allocator, img: c.Image) c.Error![]u8 {
     try appendChunk(gpa, &out, "IEND", "");
     return out.toOwnedSlice(gpa);
 }
+
+test "fuzz: arbitrary and corrupted PNGs never crash the decoder" {
+    var prng: std.Random.DefaultPrng = .init(0x706e_6721);
+    const rand = prng.random();
+    const gpa = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+    for (0..20_000) |_| {
+        const n = rand.uintLessThan(usize, buf.len);
+        rand.bytes(buf[0..n]);
+        // A valid signature gets the bytes past the chunk scanner's first check.
+        if (n >= 8 and rand.boolean()) @memcpy(buf[0..8], &c.png_signature);
+        const img = decodePng(gpa, buf[0..n]) catch continue;
+        img.deinit(gpa);
+    }
+}
